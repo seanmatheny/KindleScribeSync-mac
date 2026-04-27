@@ -1,4 +1,5 @@
-debug.log
+dource /Users/smat924/git/KindleScribeSync-mac/.venv/bin/activate
+bug.log
 cookies.pkl
 notebooks.json
 config.json
@@ -6,3 +7,4 @@ kindlescribesync.lock
 venv/
 kindle_notebooks/
 extraction/
+bear_pending_deletes.json
