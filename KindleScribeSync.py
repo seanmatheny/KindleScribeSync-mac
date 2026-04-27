@@ -465,7 +465,23 @@ def bear_trash_note(*, reason, title=None, search_term=None):
     return False
 
 
-def trash_bear_for_notebook(notebook_id, notebook_meta, reason):
+def bear_trash_all_matches(*, reason, title=None, search_term=None, max_attempts=1):
+    """
+    Run multiple trash passes to remove duplicate Bear notes that match the same key.
+    """
+    max_attempts = max(int(max_attempts), 1)
+    success = True
+    for attempt in range(1, max_attempts + 1):
+        attempt_reason = "{}_attempt{}".format(reason, attempt)
+        ok = bear_trash_note(reason=attempt_reason, title=title, search_term=search_term)
+        success = success and ok
+        # Give Bear a moment to update search results between repeated trash requests.
+        if attempt < max_attempts and not bear_dry_run:
+            time.sleep(0.2)
+    return success
+
+
+def trash_bear_for_notebook(notebook_id, notebook_meta, reason, aggressive=False):
     """
     Remove the Bear note(s) associated with a notebook ID.
     """
@@ -473,19 +489,34 @@ def trash_bear_for_notebook(notebook_id, notebook_meta, reason):
         return
 
     marker = build_bear_marker(notebook_id)
+    title_attempts = 5 if aggressive else 2
+    marker_attempts = 10 if aggressive else 3
+    name_attempts = 3 if aggressive else 1
 
     previous_bear_title = notebook_meta.get("bearTitle")
     if previous_bear_title:
         # Most reliable path: delete by exact stored Bear title.
-        bear_trash_note(title=previous_bear_title, reason="{}_title".format(reason))
+        bear_trash_all_matches(
+            title=previous_bear_title,
+            reason="{}_title".format(reason),
+            max_attempts=title_attempts,
+        )
 
     # Fallback for any older notes that still need marker-based matching.
-    bear_trash_note(search_term=marker, reason="{}_marker".format(reason))
+    bear_trash_all_matches(
+        search_term=marker,
+        reason="{}_marker".format(reason),
+        max_attempts=marker_attempts,
+    )
 
     notebook_name = notebook_meta.get("name")
     if notebook_name and notebook_name != previous_bear_title:
         # Last-resort cleanup for legacy state where stored bearTitle may be missing/stale.
-        bear_trash_note(title=notebook_name, reason="{}_name_fallback".format(reason))
+        bear_trash_all_matches(
+            title=notebook_name,
+            reason="{}_name_fallback".format(reason),
+            max_attempts=name_attempts,
+        )
 
 
 def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
@@ -533,7 +564,7 @@ def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebo
         bear_trash_note(title=previous_bear_title, reason="migrate_title")
 
     # Always remove existing copies first so one notebook maps to one Bear note.
-    trash_bear_for_notebook(notebook_id, notebook_meta, "refresh_existing_note")
+    trash_bear_for_notebook(notebook_id, notebook_meta, "refresh_existing_note", aggressive=False)
 
     created = bear_open_xurl("create", create_params)
     if created:
@@ -834,7 +865,7 @@ def prune_orphans(items, sync_items):
                 except Exception:
                     logger.error("Pruning '{}' Folder Failed!".format(folder_path))
             if dict_object["type"] == "notebook":
-                trash_bear_for_notebook(k, dict_object, "prune_orphan")
+                trash_bear_for_notebook(k, dict_object, "prune_orphan", aggressive=True)
                 pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(dict_object['path']))
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
