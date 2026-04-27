@@ -55,6 +55,7 @@ RENDER_HEIGHT = 2500
 RENDER_WIDTH = 1200
 NOTEBOOK_JSON_PATH = "notebooks.json"
 BEAR_PENDING_DELETES_PATH = "bear_pending_deletes.json"
+BEAR_DELETE_RETRY_RUNS = 24
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 3
@@ -455,11 +456,13 @@ def bear_open_xurl(action, params):
 
 def bear_trash_note(*, reason, title=None, search_term=None):
     """
-    Trash a Bear note by exact title or fallback search term.
+    Trash a Bear note using Bear's supported trash keys (id/search).
     """
     if title:
-        logger.info("Attempting Bear trash for reason='%s' title='%s'", reason, title)
-        return bear_open_xurl("trash", {"title": title, "show_window": "no"})
+        # /trash accepts only id/search; quoted title behaves like an exact phrase search.
+        title_search = '"{}"'.format(title)
+        logger.info("Attempting Bear trash for reason='%s' title-search=%s", reason, title_search)
+        return bear_open_xurl("trash", {"search": title_search, "show_window": "no"})
     if search_term:
         logger.info("Attempting Bear trash for reason='%s' search='%s'", reason, search_term)
         return bear_open_xurl("trash", {"search": search_term, "show_window": "no"})
@@ -664,6 +667,7 @@ def queue_bear_delete(notebook_id, notebook_meta):
         "queuedAt": existing.get("queuedAt") or datetime.now().isoformat(timespec="seconds"),
         "lastAttemptAt": existing.get("lastAttemptAt"),
         "attempts": int(existing.get("attempts", 0)),
+        "remainingRuns": max(int(existing.get("remainingRuns", 0)), BEAR_DELETE_RETRY_RUNS),
     }
 
 
@@ -679,9 +683,10 @@ def process_pending_bear_deletes():
         pending_meta = bear_pending_deletes[notebook_id]
         pending_meta["attempts"] = int(pending_meta.get("attempts", 0)) + 1
         pending_meta["lastAttemptAt"] = datetime.now().isoformat(timespec="seconds")
-        success = trash_bear_for_notebook(notebook_id, pending_meta, "retry_pending_delete", aggressive=True)
-        if success:
-            logger.info("Completed pending Bear cleanup for notebook id=%s", notebook_id)
+        pending_meta["remainingRuns"] = int(pending_meta.get("remainingRuns", BEAR_DELETE_RETRY_RUNS)) - 1
+        trash_bear_for_notebook(notebook_id, pending_meta, "retry_pending_delete", aggressive=True)
+        if pending_meta["remainingRuns"] <= 0:
+            logger.info("Expiring pending Bear cleanup retries for notebook id=%s", notebook_id)
             del bear_pending_deletes[notebook_id]
 
 def close_app():
@@ -930,8 +935,7 @@ def prune_orphans(items, sync_items):
                     logger.error("Pruning '{}' Folder Failed!".format(folder_path))
             if dict_object["type"] == "notebook":
                 queue_bear_delete(k, dict_object)
-                if trash_bear_for_notebook(k, dict_object, "prune_orphan", aggressive=True):
-                    bear_pending_deletes.pop(k, None)
+                trash_bear_for_notebook(k, dict_object, "prune_orphan", aggressive=True)
                 pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(dict_object['path']))
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
