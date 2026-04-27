@@ -54,6 +54,7 @@ from selenium.webdriver.support import expected_conditions as EC
 RENDER_HEIGHT = 2500
 RENDER_WIDTH = 1200
 NOTEBOOK_JSON_PATH = "notebooks.json"
+BEAR_PENDING_DELETES_PATH = "bear_pending_deletes.json"
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 3
@@ -105,6 +106,7 @@ bear_sync_enabled = False
 bear_dry_run = False
 bear_force_resync = False
 notebook_name_counts = {}
+bear_pending_deletes = {}
 config = {
     "update_minutes": UPDATE_MINUTES,
     "bear_sync": False,
@@ -486,24 +488,25 @@ def trash_bear_for_notebook(notebook_id, notebook_meta, reason, aggressive=False
     Remove the Bear note(s) associated with a notebook ID.
     """
     if not bear_sync_enabled:
-        return
+        return False
 
     marker = build_bear_marker(notebook_id)
     title_attempts = 5 if aggressive else 2
     marker_attempts = 10 if aggressive else 3
     name_attempts = 3 if aggressive else 1
+    success = True
 
     previous_bear_title = notebook_meta.get("bearTitle")
     if previous_bear_title:
         # Most reliable path: delete by exact stored Bear title.
-        bear_trash_all_matches(
+        success = success and bear_trash_all_matches(
             title=previous_bear_title,
             reason="{}_title".format(reason),
             max_attempts=title_attempts,
         )
 
     # Fallback for any older notes that still need marker-based matching.
-    bear_trash_all_matches(
+    success = success and bear_trash_all_matches(
         search_term=marker,
         reason="{}_marker".format(reason),
         max_attempts=marker_attempts,
@@ -512,11 +515,13 @@ def trash_bear_for_notebook(notebook_id, notebook_meta, reason, aggressive=False
     notebook_name = notebook_meta.get("name")
     if notebook_name and notebook_name != previous_bear_title:
         # Last-resort cleanup for legacy state where stored bearTitle may be missing/stale.
-        bear_trash_all_matches(
+        success = success and bear_trash_all_matches(
             title=notebook_name,
             reason="{}_name_fallback".format(reason),
             max_attempts=name_attempts,
         )
+
+    return success
 
 
 def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
@@ -612,6 +617,21 @@ def load_notebook_json():
         with open(NOTEBOOK_JSON_PATH, "r", encoding="utf-8") as f:
             notebooks = json.load(f)
 
+
+def load_bear_pending_deletes():
+    """
+    Load queued Bear notebook deletes that still need retry.
+    """
+    global bear_pending_deletes
+    logger.info("Attempting to load pending Bear delete file")
+    if os.path.exists(BEAR_PENDING_DELETES_PATH):
+        logger.info("Loading pending Bear delete file")
+        with open(BEAR_PENDING_DELETES_PATH, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            bear_pending_deletes = loaded if isinstance(loaded, dict) else {}
+    else:
+        bear_pending_deletes = {}
+
 def save_notebook_json():
     """
     Saves the `notebooks` global to a file
@@ -620,6 +640,49 @@ def save_notebook_json():
     logger.info("Saving notebook data file")
     with open(NOTEBOOK_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(notebooks, f)
+
+
+def save_bear_pending_deletes():
+    """
+    Save queued Bear notebook deletes so retries survive process restarts.
+    """
+    logger.info("Saving pending Bear delete file")
+    with open(BEAR_PENDING_DELETES_PATH, "w", encoding="utf-8") as f:
+        json.dump(bear_pending_deletes, f)
+
+
+def queue_bear_delete(notebook_id, notebook_meta):
+    """
+    Persist enough metadata to retry Bear note cleanup later.
+    """
+    global bear_pending_deletes
+    existing = bear_pending_deletes.get(notebook_id, {})
+    bear_pending_deletes[notebook_id] = {
+        "name": notebook_meta.get("name") or existing.get("name"),
+        "path": notebook_meta.get("path") or existing.get("path"),
+        "bearTitle": notebook_meta.get("bearTitle") or existing.get("bearTitle"),
+        "queuedAt": existing.get("queuedAt") or datetime.now().isoformat(timespec="seconds"),
+        "lastAttemptAt": existing.get("lastAttemptAt"),
+        "attempts": int(existing.get("attempts", 0)),
+    }
+
+
+def process_pending_bear_deletes():
+    """
+    Retry Bear cleanup for notebooks deleted in earlier runs.
+    """
+    global bear_pending_deletes
+    if not bear_sync_enabled or not bear_pending_deletes:
+        return
+
+    for notebook_id in list(bear_pending_deletes.keys()):
+        pending_meta = bear_pending_deletes[notebook_id]
+        pending_meta["attempts"] = int(pending_meta.get("attempts", 0)) + 1
+        pending_meta["lastAttemptAt"] = datetime.now().isoformat(timespec="seconds")
+        success = trash_bear_for_notebook(notebook_id, pending_meta, "retry_pending_delete", aggressive=True)
+        if success:
+            logger.info("Completed pending Bear cleanup for notebook id=%s", notebook_id)
+            del bear_pending_deletes[notebook_id]
 
 def close_app():
     """
@@ -630,6 +693,7 @@ def close_app():
     running = False
     logger.info("Closing application")
     save_cookies()
+    save_bear_pending_deletes()
     release_single_instance_lock()
     if driver is not None:
         try:
@@ -865,7 +929,9 @@ def prune_orphans(items, sync_items):
                 except Exception:
                     logger.error("Pruning '{}' Folder Failed!".format(folder_path))
             if dict_object["type"] == "notebook":
-                trash_bear_for_notebook(k, dict_object, "prune_orphan", aggressive=True)
+                queue_bear_delete(k, dict_object)
+                if trash_bear_for_notebook(k, dict_object, "prune_orphan", aggressive=True):
+                    bear_pending_deletes.pop(k, None)
                 pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(dict_object['path']))
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
@@ -899,6 +965,8 @@ def get_all_notebooks():
     notebook_name_counts = collect_notebook_name_counts(data['itemsList'])
     iterate_notebooks(data['itemsList'], notebooks)
     prune_orphans(notebooks, data['itemsList'])
+    process_pending_bear_deletes()
+    save_bear_pending_deletes()
     save_notebook_json()
 
 def load_cookies():
@@ -1080,6 +1148,7 @@ def main():
     os.makedirs(SYNC_PATH, exist_ok=True)
 
     load_notebook_json()
+    load_bear_pending_deletes()
 
     if args.reset_bear_state:
         handle_reset_bear_state()
