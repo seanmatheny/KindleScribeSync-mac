@@ -524,6 +524,15 @@ def trash_bear_for_notebook(notebook_id, notebook_meta, reason, aggressive=False
             max_attempts=name_attempts,
         )
 
+    notebook_path = notebook_meta.get("path")
+    if notebook_path:
+        # Legacy notes can still be found by their path line in note body.
+        success = success and bear_trash_all_matches(
+            search_term="Notebook Path: {}".format(notebook_path),
+            reason="{}_path_fallback".format(reason),
+            max_attempts=name_attempts,
+        )
+
     return success
 
 
@@ -635,6 +644,8 @@ def load_bear_pending_deletes():
     else:
         bear_pending_deletes = {}
 
+    recover_pending_bear_deletes_from_log()
+
 def save_notebook_json():
     """
     Saves the `notebooks` global to a file
@@ -669,6 +680,65 @@ def queue_bear_delete(notebook_id, notebook_meta):
         "attempts": int(existing.get("attempts", 0)),
         "remainingRuns": max(int(existing.get("remainingRuns", 0)), BEAR_DELETE_RETRY_RUNS),
     }
+
+
+def collect_active_notebook_ids(items):
+    """
+    Collect active notebook IDs currently present in the local notebook tree.
+    """
+    ids = set()
+    for notebook_id, meta in items.items():
+        if meta.get("type") == "notebook":
+            ids.add(notebook_id)
+        elif meta.get("type") == "folder":
+            ids.update(collect_active_notebook_ids(meta.get("items", {})))
+    return ids
+
+
+def recover_pending_bear_deletes_from_log(max_lines=5000):
+    """
+    Recover missed pending deletes from prior prune log entries.
+    """
+    global bear_pending_deletes
+    if not APP_LOG_FILE.exists():
+        return
+
+    try:
+        lines = APP_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-max_lines:]
+    except Exception as ex:
+        logger.warning("Could not read log file for pending delete recovery: %s", ex)
+        return
+
+    active_ids = collect_active_notebook_ids(notebooks)
+    last_seen_id = None
+    recovered = 0
+    for line in lines:
+        id_match = re.search(
+            r"reason='(?:prune_orphan|retry_pending_delete)[^']*' search='kindle-scribe-sync-id:([0-9a-fA-F\-]+)'",
+            line,
+        )
+        if id_match:
+            last_seen_id = id_match.group(1)
+            continue
+
+        path_match = re.search(r"Pruning 'kindle_notebooks/(.+?)\\.pdf' Notebook", line)
+        if path_match and last_seen_id:
+            notebook_path = path_match.group(1)
+            if last_seen_id not in active_ids and last_seen_id not in bear_pending_deletes:
+                notebook_name = os.path.basename(notebook_path)
+                queue_bear_delete(
+                    last_seen_id,
+                    {
+                        "name": notebook_name,
+                        "path": notebook_path,
+                        "bearTitle": notebook_name,
+                    },
+                )
+                recovered += 1
+            last_seen_id = None
+
+    if recovered > 0:
+        logger.info("Recovered %s pending Bear deletions from prior logs", recovered)
 
 
 def process_pending_bear_deletes():
