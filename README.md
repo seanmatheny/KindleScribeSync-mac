@@ -64,3 +64,34 @@ Run one sync pass without tray UI (useful for terminal-only environments)
 python KindleScribeSync.py --once --no-tray
 ```
 
+Sync updated notebooks into Bear Notes (macOS)
+```
+python KindleScribeSync.py --bear-sync
+```
+
+Run Bear sync once without tray (recommended for manual plug-in syncs)
+```
+python KindleScribeSync.py --once --no-tray --bear-sync
+```
+
+Dry-run Bear calls to preview x-callback URLs
+```
+python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
+```
+
+## Bear Notes Sync Behavior
+
+- Bear sync is optional and enabled only with `--bear-sync`.
+- A root tag `#scribe` is applied to all synced notes.
+- A subtag is generated from notebook path, for example `#scribe/work`.
+- Each Kindle notebook gets a stable Bear note title based on notebook ID, so future syncs can refresh the same note.
+- On first sync for a notebook, the note is created in Bear.
+- On subsequent syncs, note body is replaced using Bear `add-text` with `mode=replace_all`, which keeps the note current.
+
+Each Bear note includes:
+- Notebook title
+- Notebook ID
+- Source path
+- Last sync timestamp
+- File link to the exported PDF
+
