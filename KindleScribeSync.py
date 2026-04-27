@@ -56,7 +56,7 @@ RENDER_WIDTH = 1200
 NOTEBOOK_JSON_PATH = "notebooks.json"
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
-BEAR_SYNC_VERSION = 2
+BEAR_SYNC_VERSION = 3
 CONFIG_FILE = "config.json"
 LOCK_FILE = "kindlescribesync.lock"
 LAUNCH_AGENT_LABEL = "com.github.kindlescribesync"
@@ -406,6 +406,22 @@ def bear_trash_note(search_term, reason):
     return bear_open_xurl("trash", {"search": search_term, "show_window": "no"})
 
 
+def trash_bear_for_notebook(notebook_id, notebook_meta, reason):
+    """
+    Remove the Bear note(s) associated with a notebook ID.
+    """
+    if not bear_sync_enabled:
+        return
+
+    marker = build_bear_marker(notebook_id)
+    bear_trash_note(marker, "{}_marker".format(reason))
+
+    previous_bear_title = notebook_meta.get("bearTitle")
+    if previous_bear_title:
+        # Fallback for older notes where marker text may not have been searchable.
+        bear_trash_note(previous_bear_title, "{}_title_fallback".format(reason))
+
+
 def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
     """
     Recreate the notebook note in Bear with the latest attached PDF.
@@ -424,7 +440,7 @@ def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebo
         "Notebook Path: {}\n"
         "Last Synced: {}\n\n"
         "Attached: latest Kindle Scribe PDF export.\n\n"
-        "<!-- {} -->\n"
+        "Sync Marker: {}\n"
     ).format(notebook_path, datetime.now().isoformat(timespec="seconds"), marker)
     filename = Path(pdf_path).name
     encoded_file = encode_file_for_bear(pdf_path)
@@ -447,12 +463,11 @@ def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebo
         notebook_meta.get("bearCreated", False),
     )
 
-    # Migrate notes created with the previous UUID title scheme.
     if previous_bear_title and previous_bear_title != bear_title:
         bear_trash_note(previous_bear_title, "migrate_title")
 
-    if notebook_meta.get("bearCreated", False):
-        bear_trash_note(marker, "refresh_existing_note")
+    # Always remove existing copies first so one notebook maps to one Bear note.
+    trash_bear_for_notebook(notebook_id, notebook_meta, "refresh_existing_note")
 
     created = bear_open_xurl("create", create_params)
     if created:
@@ -622,17 +637,16 @@ def iterate_notebooks(obj, parentObj):
     for x in obj:
         id = x['id']
         safe_title = sanitize_name(x['title'])
+        if 'path' in parentObj:
+            new_path = os.path.join(parentObj['path'], safe_title)
+        else:
+            new_path = safe_title
 
         if not id in parentItems:
-            if 'path' in parentObj:
-                newPath = os.path.join(parentObj['path'], safe_title)
-            else:
-                newPath = safe_title
-
             parentItems[id] = {
                 'type': x['type'],
                 'name': x['title'],
-                'path': newPath,
+                'path': new_path,
                 'updateTime': 0,
                 'items': {},
                 'bearCreated': False,
@@ -640,6 +654,23 @@ def iterate_notebooks(obj, parentObj):
             }
         else:
             ensure_notebook_tracking_defaults(id, parentItems[id])
+            old_path = parentItems[id].get('path')
+            if old_path != new_path:
+                if x['type'] == 'folder':
+                    old_folder_path = os.path.join(SYNC_PATH, old_path)
+                    new_folder_path = os.path.join(SYNC_PATH, new_path)
+                    if os.path.exists(old_folder_path) and not os.path.exists(new_folder_path):
+                        os.makedirs(os.path.dirname(new_folder_path), exist_ok=True)
+                        os.rename(old_folder_path, new_folder_path)
+                elif x['type'] == 'notebook':
+                    old_pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(old_path))
+                    new_pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(new_path))
+                    if os.path.exists(old_pdf_path) and not os.path.exists(new_pdf_path):
+                        os.makedirs(os.path.dirname(new_pdf_path), exist_ok=True)
+                        os.rename(old_pdf_path, new_pdf_path)
+                parentItems[id]['path'] = new_path
+
+            parentItems[id]['name'] = x['title']
         
         if x['type'] == "folder":
             folder_path = os.path.join(SYNC_PATH, parentItems[id]['path'])
@@ -726,6 +757,8 @@ def prune_orphans(items, sync_items):
         index = id_exists_in_object(k, sync_items)
         if  index == -1:
             if dict_object["type"] == "folder":
+                # Remove Bear notes for notebooks that disappeared remotely.
+                prune_orphans(dict_object["items"], [])
                 folder_path = os.path.join(SYNC_PATH, dict_object['path'])
                 try:
                     logger.info("Pruning '{}' Folder".format(folder_path))
@@ -734,6 +767,7 @@ def prune_orphans(items, sync_items):
                 except Exception:
                     logger.error("Pruning '{}' Folder Failed!".format(folder_path))
             if dict_object["type"] == "notebook":
+                trash_bear_for_notebook(k, dict_object, "prune_orphan")
                 pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(dict_object['path']))
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
