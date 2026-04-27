@@ -1,4 +1,4 @@
-#!/bin/python3
+#!/usr/bin/env python3
 #
 # Kindle Scribe Sync
 # Copyright (c) 2025 Koloss5421
@@ -21,11 +21,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import os, io, sys, json, time, pickle, pystray, logging, tarfile, img2pdf, schedule, requests, selenium.webdriver, selenium.webdriver.common, selenium.webdriver.firefox, selenium.webdriver.firefox.firefox_binary
-from PIL import Image
-from shutil import rmtree
+import argparse
+import io
+import json
+import logging
+import os
+import pickle
+import re
+import sys
+import tarfile
+import time
 from datetime import datetime
+from pathlib import Path
+from shutil import rmtree
+
+import img2pdf
+import requests
+import schedule
+
+try:
+    import pystray
+    from PIL import Image
+except Exception:
+    pystray = None
+    Image = None
+
+from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -40,7 +63,6 @@ UPDATE_MINUTES = 30
 EXTRACT_PATH = "extraction"
 ## Where do we want to save the kindle notebooks?
 SYNC_PATH = "kindle_notebooks"
-FIREFOX_PATH = "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
 ## User agent must be an android user agent to allow you to access the kindle-notebook site and see the api/notes page.
 USER_AGENT = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
 
@@ -49,16 +71,6 @@ URL_AUTH = "https://read.amazon.com/kindle-notebook?ref_=neo_mm_yn_na_kfa"
 URL_GET_NOTEBOOKS = "https://read.amazon.com/kindle-notebook/api/notes"
 URL_OPEN_NOTEBOOK = "https://read.amazon.com/openNotebook?notebookId=[NOTEBOOK_ID]&marketplaceId=ATVPDKIKX0DER"
 URL_RENDER_NOTEBOOK = "https://read.amazon.com/renderPage?startPage=0&endPage=[NOTEBOOK_LENGTH]&width={}&height={}&dpi=160".format(RENDER_WIDTH, RENDER_HEIGHT)
-
-ff_options = selenium.webdriver.FirefoxOptions()
-ff_profile = selenium.webdriver.FirefoxProfile()
-
-## Selenium basic options
-ff_options.binary_location = FIREFOX_PATH
-ff_options.profile = ff_profile
-ff_profile.set_preference("general.useragent.override", USER_AGENT)
-ff_profile.set_preference("network.proxy.type", 2)
-driver = selenium.webdriver.Firefox(ff_options)
 
 ## Setup Logging
 logging.basicConfig(
@@ -75,9 +87,40 @@ logger = logging.getLogger()
 notebooks = {}
 cookies = None
 session = None
+driver = None
 running = True
 update_count = 0
 last_update = "No Updates"
+use_tray = True
+args = None
+tray_icon = None
+
+
+def sanitize_name(name):
+    """
+    Sanitize notebook/folder names for cross-platform file systems.
+    """
+    cleaned = re.sub(r"[\\/:*?\"<>|]", "_", name).strip()
+    return cleaned or "untitled"
+
+
+def build_driver():
+    """
+    Build a Firefox webdriver instance with a mobile user-agent.
+    """
+    options = Options()
+    options.set_preference("general.useragent.override", USER_AGENT)
+    options.set_preference("network.proxy.type", 0)
+    return webdriver.Firefox(options=options)
+
+
+def ensure_driver():
+    """
+    Create the webdriver lazily so startup works even with valid saved cookies.
+    """
+    global driver
+    if driver is None:
+        driver = build_driver()
 
 def load_notebook_json():
     """
@@ -87,7 +130,7 @@ def load_notebook_json():
     logger.info("Attempting to load notebook data file")
     if os.path.exists(NOTEBOOK_JSON_PATH):
         logger.info("Loading notebook data file")
-        with open(NOTEBOOK_JSON_PATH, "rb") as f:
+        with open(NOTEBOOK_JSON_PATH, "r", encoding="utf-8") as f:
             notebooks = json.load(f)
 
 def save_notebook_json():
@@ -96,7 +139,7 @@ def save_notebook_json():
     """
     global notebooks
     logger.info("Saving notebook data file")
-    with open(NOTEBOOK_JSON_PATH, "w") as f:
+    with open(NOTEBOOK_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(notebooks, f)
 
 def close_app():
@@ -104,15 +147,20 @@ def close_app():
     shutdown the application
     """
     global driver
-    global tray_icon
     global running
     running = False
     logger.info("Closing application")
     save_cookies()
-    tray_icon.stop()
+    if tray_icon is not None:
+        tray_icon.stop()
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
     try:
         sys.exit()
-    except:
+    except Exception:
         pass
 
 def update_info(icon, item):
@@ -129,6 +177,7 @@ def convert_to_pdf(images, savepath):
     Uses `img2pdf` to convert an array of image paths (`images`) to a pdf (`savepath`).
     """
     logger.info("Converting extracted images to pdf output: {}".format(savepath))
+    os.makedirs(os.path.dirname(savepath), exist_ok=True)
     with open(savepath, "wb") as f:
         pdfdata = img2pdf.convert(images)
         f.write(pdfdata)
@@ -143,8 +192,8 @@ def extract_tarfile(tar_file_data):
     images = []
     for member in tar_file:
         if member.name.endswith(".png"):
-            extr_path = "{}\\{}".format(EXTRACT_PATH, member.name)
             tar_file.extract(member, path=EXTRACT_PATH)
+            extr_path = os.path.join(EXTRACT_PATH, member.name)
             images.append(extr_path)
 
     return images
@@ -204,12 +253,13 @@ def iterate_notebooks(obj, parentObj):
 
     for x in obj:
         id = x['id']
+        safe_title = sanitize_name(x['title'])
 
         if not id in parentItems:
             if 'path' in parentObj:
-                newPath = "{}\\{}".format(parentObj['path'], x['title'])
+                newPath = os.path.join(parentObj['path'], safe_title)
             else:
-                newPath = "{}".format(x['title'])
+                newPath = safe_title
 
             parentItems[id] = {
                 'type': x['type'],
@@ -220,10 +270,9 @@ def iterate_notebooks(obj, parentObj):
             }
         
         if x['type'] == "folder":
-            folder_path = "{}\\{}".format(SYNC_PATH, parentItems[id]['path'])
+            folder_path = os.path.join(SYNC_PATH, parentItems[id]['path'])
             if not os.path.exists(folder_path):
                 os.makedirs(folder_path)
-                os.removedirs
             iterate_notebooks(x['items'], parentItems[id])
 
         
@@ -239,7 +288,7 @@ def iterate_notebooks(obj, parentObj):
                 tardata = render_notebook(nb_data['renderingToken'], total_pages)
                 images = extract_tarfile(tardata)
                 
-                pdf_path = "{}\\{}.pdf".format(SYNC_PATH, parentItems[id]['path'])
+                pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(parentItems[id]['path']))
                 
                 convert_to_pdf(images, pdf_path)
 
@@ -271,20 +320,20 @@ def prune_orphans(items, sync_items):
         index = id_exists_in_object(k, sync_items)
         if  index == -1:
             if dict_object["type"] == "folder":
-                folder_path = "{}\\{}".format(SYNC_PATH, dict_object['path'])
+                folder_path = os.path.join(SYNC_PATH, dict_object['path'])
                 try:
                     logger.info("Pruning '{}' Folder".format(folder_path))
                     rmtree(folder_path)
                     update_count += 1
-                except:
+                except Exception:
                     logger.error("Pruning '{}' Folder Failed!".format(folder_path))
             if dict_object["type"] == "notebook":
-                pdf_path = "{}\\{}.pdf".format(SYNC_PATH, dict_object['path'])
+                pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(dict_object['path']))
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
                     os.remove(pdf_path)
                     update_count += 1
-                except:
+                except Exception:
                     logger.error("Pruning '{}' Notebook Failed!".format(pdf_path))
             del items[k]
         else:
@@ -324,7 +373,13 @@ def load_cookies():
         with open(COOKIES_FILE, "rb") as f:
             cookies = pickle.load(f)
 
-        if cookies == None or len(cookies) < 5:
+        if cookies is None:
+            return False
+
+        # Support old cookie formats and normalize to a simple dict.
+        if isinstance(cookies, list):
+            cookies = {cookie.get("name"): cookie.get("value") for cookie in cookies if "name" in cookie and "value" in cookie}
+        if not isinstance(cookies, dict) or len(cookies) < 2:
             return False
         
         session.cookies.update(cookies)
@@ -349,7 +404,11 @@ def rm_cookies():
     global cookies
     global driver
     logger.info("Deleting all cookies")
-    driver.delete_all_cookies()
+    if driver is not None:
+        try:
+            driver.delete_all_cookies()
+        except Exception:
+            pass
     session.cookies.clear()
     cookies = None
     if (os.path.exists(COOKIES_FILE)):
@@ -363,6 +422,7 @@ def authenticate():
     global driver
     global cookies
     global session
+    ensure_driver()
     logger.info("Authenticating to {}".format(URL_AUTH))
     driver.get(URL_AUTH)
 
@@ -376,10 +436,9 @@ def authenticate():
     finally:
         pass
 
-    cookies = driver.get_cookies()
+    driver_cookies = driver.get_cookies()
+    cookies = {cookie["name"]: cookie["value"] for cookie in driver_cookies if "name" in cookie and "value" in cookie}
     save_cookies()
-
-    driver.quit()
 
     session.cookies.update(cookies)
 
@@ -389,6 +448,7 @@ def check_notebooks():
     including forced updates with the system tray icon.
     """
     global session
+    global driver
     global update_count
     global last_update
     update_count = 0
@@ -402,7 +462,12 @@ def check_notebooks():
         if not load_cookies():
             authenticate()
         else:
-            driver.quit()
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
 
     get_all_notebooks()
 
@@ -412,32 +477,69 @@ def check_notebooks():
     logger.info("Will Check again in {} minutes...".format(UPDATE_MINUTES))
 
 
-if not os.path.exists(EXTRACT_PATH):
-    os.mkdir(EXTRACT_PATH)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sync Kindle Scribe notebooks to local PDF files.")
+    parser.add_argument("--once", action="store_true", help="Run a single sync check then exit.")
+    parser.add_argument("--no-tray", action="store_true", help="Disable system tray integration.")
+    parser.add_argument("--update-minutes", type=int, default=UPDATE_MINUTES, help="Minutes between sync checks when running continuously.")
+    return parser.parse_args()
 
-## Setup the system tray icon / menus
-menu = pystray.Menu(
-    pystray.MenuItem('Last Update', update_info),
-    pystray.MenuItem('Force Sync', check_notebooks),
-    pystray.MenuItem('Quit', close_app)
-)
 
-tray_image = Image.open("KindleScribeSyncIcon.png")
-tray_icon = pystray.Icon("Kindle Scribe Sync", tray_image, "Kindle Scribe Sync", menu)  
+def setup_tray_if_available():
+    global tray_icon
+    if not use_tray:
+        return
+    if pystray is None or Image is None:
+        logger.warning("pystray/Pillow not available; running without tray.")
+        return
 
-## Load the notebook json object
-load_notebook_json()
+    icon_path = Path(__file__).resolve().parent / "KindleScribeSyncIcon.png"
+    if not icon_path.exists():
+        logger.warning("Tray icon image not found; running without tray.")
+        return
 
-logger.info("Running Tray Icon")
-tray_icon.run_detached()
+    menu = pystray.Menu(
+        pystray.MenuItem('Last Update', update_info),
+        pystray.MenuItem('Force Sync', check_notebooks),
+        pystray.MenuItem('Quit', close_app)
+    )
 
-logger.info("Running initial check")
-check_notebooks()
+    tray_image = Image.open(str(icon_path))
+    tray_icon = pystray.Icon("Kindle Scribe Sync", tray_image, "Kindle Scribe Sync", menu)
+    logger.info("Running Tray Icon")
+    tray_icon.run_detached()
 
-## schedule the check_notebooks function
-schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks)
 
-## Run forever please.
-while running:
-    schedule.run_pending()
-    time.sleep(1)
+def main():
+    global UPDATE_MINUTES
+    global use_tray
+    global args
+
+    args = parse_args()
+    UPDATE_MINUTES = max(args.update_minutes, 1)
+    use_tray = not args.no_tray
+
+    if not os.path.exists(EXTRACT_PATH):
+        os.mkdir(EXTRACT_PATH)
+
+    # Ensure output root exists to avoid path errors on first run.
+    os.makedirs(SYNC_PATH, exist_ok=True)
+
+    load_notebook_json()
+    setup_tray_if_available()
+
+    logger.info("Running initial check")
+    check_notebooks()
+
+    if args.once:
+        logger.info("Single-run mode complete")
+        return
+
+    schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks)
+    while running:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
