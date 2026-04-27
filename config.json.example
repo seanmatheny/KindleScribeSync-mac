@@ -1,0 +1,6 @@
+{
+  "update_minutes": 30,
+  "bear_sync": false,
+  "bear_dry_run": false,
+  "bear_force_resync": false
+}

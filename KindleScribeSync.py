@@ -32,8 +32,8 @@ import plistlib
 import re
 import subprocess
 import sys
+import signal
 import tarfile
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -43,13 +43,6 @@ from urllib.parse import quote, urlencode
 import img2pdf
 import requests
 import schedule
-
-try:
-    import pystray
-    from PIL import Image
-except Exception:
-    pystray = None
-    Image = None
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -64,10 +57,13 @@ NOTEBOOK_JSON_PATH = "notebooks.json"
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 2
-SETTINGS_FILE = "settings.json"
+CONFIG_FILE = "config.json"
 LOCK_FILE = "kindlescribesync.lock"
 LAUNCH_AGENT_LABEL = "com.github.kindlescribesync"
-INTERVAL_OPTIONS = (5, 15, 30, 60, 180)
+LOG_DIR = Path.home() / "Library" / "Logs" / "KindleScribeSync"
+APP_LOG_FILE = LOG_DIR / "KindleScribeSync.log"
+LAUNCHD_STDOUT_LOG = LOG_DIR / "launchd.out.log"
+LAUNCHD_STDERR_LOG = LOG_DIR / "launchd.err.log"
 
 ## Where to extract tar images
 EXTRACT_PATH = "extraction"
@@ -83,13 +79,15 @@ URL_OPEN_NOTEBOOK = "https://read.amazon.com/openNotebook?notebookId=[NOTEBOOK_I
 URL_RENDER_NOTEBOOK = "https://read.amazon.com/renderPage?startPage=0&endPage=[NOTEBOOK_LENGTH]&width={}&height={}&dpi=160".format(RENDER_WIDTH, RENDER_HEIGHT)
 
 ## Setup Logging
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+log_handlers = [logging.FileHandler(APP_LOG_FILE, encoding="utf-8")]
+if sys.stdout.isatty():
+    log_handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s",
-    handlers=[
-        logging.FileHandler("debug.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=log_handlers,
 )
 logger = logging.getLogger()
 
@@ -101,17 +99,16 @@ driver = None
 running = True
 update_count = 0
 last_update = "No Updates"
-use_tray = True
 args = None
-tray_icon = None
 bear_sync_enabled = False
 bear_dry_run = False
 bear_force_resync = False
 notebook_name_counts = {}
-sync_thread = None
-app_settings = {
+config = {
     "update_minutes": UPDATE_MINUTES,
-    "bear_sync_enabled": False,
+    "bear_sync": False,
+    "bear_dry_run": False,
+    "bear_force_resync": False,
 }
 
 
@@ -150,45 +147,25 @@ def release_single_instance_lock():
         pass
 
 
-def suppress_dock_icon():
-    """
-    Hide the Python dock icon so the app appears only in the menu bar.
-    pystray on macOS already pulls in pyobjc, so AppKit is always available
-    when pystray is importable.
-    """
-    if sys.platform != "darwin":
-        return
-    try:
-        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
-        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-        logger.info("Dock icon suppressed; running as menu bar app.")
-    except Exception as ex:
-        logger.warning("Could not suppress dock icon: %s", ex)
+def get_config_path():
+    return Path(__file__).resolve().parent / CONFIG_FILE
 
 
-def get_settings_path():
-    return Path(__file__).resolve().parent / SETTINGS_FILE
-
-
-def load_settings():
+def load_config():
     """
-    Load persisted app settings.
+    Load config.json into the global config dict.
+    CLI flags always take precedence; this only fills in values not supplied on the command line.
     """
-    global app_settings
-    settings_path = get_settings_path()
-    if settings_path.exists():
+    global config
+    config_path = get_config_path()
+    if config_path.exists():
         try:
-            app_settings.update(json.loads(settings_path.read_text(encoding="utf-8")))
+            config.update(json.loads(config_path.read_text(encoding="utf-8")))
+            logger.info("Loaded config from %s", config_path)
         except Exception as ex:
-            logger.warning("Failed to load settings file %s: %s", settings_path, ex)
-
-
-def save_settings():
-    """
-    Persist app settings for future runs and launchd startup.
-    """
-    settings_path = get_settings_path()
-    settings_path.write_text(json.dumps(app_settings, indent=2), encoding="utf-8")
+            logger.warning("Failed to load config file %s: %s", config_path, ex)
+    else:
+        logger.info("No config.json found at %s; using defaults.", config_path)
 
 
 def get_launch_agent_path():
@@ -196,22 +173,7 @@ def get_launch_agent_path():
 
 
 def notify(message, title="Kindle Scribe Sync"):
-    if tray_icon is not None:
-        try:
-            tray_icon.notify(message, title)
-        except Exception:
-            logger.info("Notification: %s - %s", title, message)
-    else:
-        logger.info("Notification: %s - %s", title, message)
-
-
-def refresh_tray_menu():
-    if tray_icon is not None:
-        tray_icon.menu = build_tray_menu()
-        try:
-            tray_icon.update_menu()
-        except Exception:
-            pass
+    logger.info("%s: %s", title, message)
 
 
 def build_launch_agent_plist():
@@ -221,11 +183,10 @@ def build_launch_agent_plist():
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": [python_path, script_path],
         "WorkingDirectory": str(Path(__file__).resolve().parent),
-        "LimitLoadToSessionType": ["Aqua"],
         "RunAtLoad": True,
-        "ProcessType": "Interactive",
-        "StandardOutPath": str((Path(__file__).resolve().parent / "debug.log").resolve()),
-        "StandardErrorPath": str((Path(__file__).resolve().parent / "debug.log").resolve()),
+        "ProcessType": "Background",
+        "StandardOutPath": str(LAUNCHD_STDOUT_LOG),
+        "StandardErrorPath": str(LAUNCHD_STDERR_LOG),
     }
 
 
@@ -255,11 +216,12 @@ def bootout_launch_agent(plist_path):
 def install_launch_agent(icon=None, item=None):
     plist_path = get_launch_agent_path()
     plist_path.parent.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     with open(plist_path, "wb") as handle:
         plistlib.dump(build_launch_agent_plist(), handle)
 
     if not bootout_launch_agent(plist_path):
-        notify("Launch agent install failed while unloading previous job. See debug.log for details.")
+        notify("Launch agent install failed while unloading previous job. See logs in ~/Library/Logs/KindleScribeSync.")
         return
 
     domain = "gui/{}".format(os.getuid())
@@ -267,13 +229,13 @@ def install_launch_agent(icon=None, item=None):
     if result.returncode == 0:
         notify("Launch agent installed. App will start automatically at login.")
     else:
-        notify("Launch agent install failed. See debug.log for details.")
+        notify("Launch agent install failed. See logs in ~/Library/Logs/KindleScribeSync.")
 
 
 def remove_launch_agent(icon=None, item=None):
     plist_path = get_launch_agent_path()
     if plist_path.exists() and not bootout_launch_agent(plist_path):
-        notify("Launch agent removal failed. See debug.log for details.")
+        notify("Launch agent removal failed. See logs in ~/Library/Logs/KindleScribeSync.")
         return
 
     if plist_path.exists():
@@ -319,54 +281,10 @@ def handle_reset_bear_state(icon=None, item=None):
     notify("Reset local Bear sync state. The next Bear sync will recreate notes.")
 
 
-def trigger_sync(icon=None, item=None):
-    check_notebooks()
-    refresh_tray_menu()
-
-
 def configure_schedule():
     schedule.clear("sync")
     schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks).tag("sync")
     logger.info("Scheduled sync every %s minutes", UPDATE_MINUTES)
-
-
-def set_update_interval(minutes):
-    def callback(icon=None, item=None):
-        global UPDATE_MINUTES
-        UPDATE_MINUTES = minutes
-        app_settings["update_minutes"] = minutes
-        save_settings()
-        configure_schedule()
-        notify("Sync interval set to {} minutes.".format(minutes))
-        refresh_tray_menu()
-
-    return callback
-
-
-def build_interval_menu():
-    return pystray.Menu(*[
-        pystray.MenuItem(
-            "{} minutes".format(minutes),
-            set_update_interval(minutes),
-            checked=lambda item, target=minutes: app_settings.get("update_minutes", UPDATE_MINUTES) == target,
-            radio=True,
-        )
-        for minutes in INTERVAL_OPTIONS
-    ])
-
-
-def build_tray_menu():
-    return pystray.Menu(
-        pystray.MenuItem(lambda item: "Last Sync: {}".format(last_update), None, enabled=False),
-        pystray.MenuItem(lambda item: "Interval: {} min".format(app_settings.get("update_minutes", UPDATE_MINUTES)), None, enabled=False),
-        pystray.MenuItem('Sync Now', trigger_sync),
-        pystray.MenuItem('Sync Interval', build_interval_menu()),
-        pystray.MenuItem('Reset Bear State', handle_reset_bear_state),
-        pystray.MenuItem('Install Launch Agent', install_launch_agent),
-        pystray.MenuItem('Remove Launch Agent', remove_launch_agent),
-        pystray.MenuItem('Launch Agent Status', launch_agent_status),
-        pystray.MenuItem('Quit', close_app)
-    )
 
 
 def slugify_tag_part(value):
@@ -601,8 +519,6 @@ def close_app():
     logger.info("Closing application")
     save_cookies()
     release_single_instance_lock()
-    if tray_icon is not None:
-        tray_icon.stop()
     if driver is not None:
         try:
             driver.quit()
@@ -616,7 +532,6 @@ def run_sync_loop():
 
     if args is not None and args.once:
         logger.info("Single-run mode complete")
-        close_app()
         return
 
     configure_schedule()
@@ -624,24 +539,6 @@ def run_sync_loop():
         schedule.run_pending()
         time.sleep(1)
 
-
-def start_sync_thread(icon=None):
-    global sync_thread
-
-    if sync_thread is not None and sync_thread.is_alive():
-        return
-
-    sync_thread = threading.Thread(target=run_sync_loop, name="SyncLoop", daemon=True)
-    sync_thread.start()
-
-def update_info(icon, item):
-    """
-    callback for `pystray` menu item. `Last Update` button notification stating the last update time and number of items updated.
-    """
-    global last_update
-    global update_count
-    notify_string = "Last Updated: {} | Updated '{}' item(s)".format(last_update, str(update_count))
-    icon.notify(notify_string)
 
 def convert_to_pdf(images, savepath):
     """
@@ -984,7 +881,6 @@ def check_notebooks():
 
     now = datetime.now()
     last_update = now.strftime("%m/%d/%Y, %H:%M:%S")
-    refresh_tray_menu()
 
     logger.info("Will Check again in {} minutes...".format(UPDATE_MINUTES))
 
@@ -992,7 +888,6 @@ def check_notebooks():
 def parse_args():
     parser = argparse.ArgumentParser(description="Sync Kindle Scribe notebooks to local PDF files.")
     parser.add_argument("--once", action="store_true", help="Run a single sync check then exit.")
-    parser.add_argument("--no-tray", action="store_true", help="Disable system tray integration.")
     parser.add_argument("--bear-sync", action="store_true", help="Sync updated notebook exports to Bear notes using x-callback-url (macOS only).")
     parser.add_argument("--bear-dry-run", action="store_true", help="Print Bear x-callback URLs without opening them.")
     parser.add_argument("--bear-force-resync", action="store_true", help="Recreate Bear notes even when local sync state says they are already current.")
@@ -1000,51 +895,32 @@ def parse_args():
     parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
     parser.add_argument("--launchd-remove", action="store_true", help="Remove the macOS launch agent.")
     parser.add_argument("--launchd-status", action="store_true", help="Print whether the macOS launch agent is installed.")
-    parser.add_argument("--update-minutes", type=int, default=None, help="Minutes between sync checks when running continuously.")
+    parser.add_argument("--update-minutes", type=int, default=None, help="Minutes between sync checks. Overrides config.json.")
     return parser.parse_args()
 
 
-def setup_tray_if_available():
-    global tray_icon
-    if not use_tray:
-        return False
-    if pystray is None or Image is None:
-        logger.warning("pystray/Pillow not available; running without tray.")
-        return False
-
-    icon_path = Path(__file__).resolve().parent / "KindleScribeSyncIcon.png"
-    if not icon_path.exists():
-        logger.warning("Tray icon image not found; running without tray.")
-        return False
-
-    suppress_dock_icon()
-    tray_image = Image.open(str(icon_path))
-    tray_icon = pystray.Icon("Kindle Scribe Sync", tray_image, "Kindle Scribe Sync", build_tray_menu())
-    logger.info("Running Tray Icon")
-    tray_icon.run(setup=start_sync_thread)
-    return True
+def handle_signal(signum, frame):
+    global running
+    logger.info("Received signal %s, shutting down.", signum)
+    running = False
 
 
 def main():
     global UPDATE_MINUTES
-    global use_tray
     global args
     global bear_sync_enabled
     global bear_dry_run
     global bear_force_resync
 
     args = parse_args()
-    load_settings()
+    load_config()
 
-    configured_minutes = args.update_minutes if args.update_minutes is not None else app_settings.get("update_minutes", UPDATE_MINUTES)
+    # CLI flags override config file values.
+    configured_minutes = args.update_minutes if args.update_minutes is not None else config.get("update_minutes", UPDATE_MINUTES)
     UPDATE_MINUTES = max(configured_minutes, 1)
-    app_settings["update_minutes"] = UPDATE_MINUTES
-    use_tray = not args.no_tray
-    bear_sync_enabled = args.bear_sync or app_settings.get("bear_sync_enabled", False)
-    bear_dry_run = args.bear_dry_run
-    bear_force_resync = args.bear_force_resync
-    app_settings["bear_sync_enabled"] = bear_sync_enabled
-    save_settings()
+    bear_sync_enabled = args.bear_sync or config.get("bear_sync", False)
+    bear_dry_run = args.bear_dry_run or config.get("bear_dry_run", False)
+    bear_force_resync = args.bear_force_resync or config.get("bear_force_resync", False)
 
     if args.launchd_install:
         install_launch_agent()
@@ -1059,6 +935,9 @@ def main():
     if not acquire_single_instance_lock():
         sys.exit(1)
 
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     if not os.path.exists(EXTRACT_PATH):
         os.mkdir(EXTRACT_PATH)
 
@@ -1070,10 +949,8 @@ def main():
     if args.reset_bear_state:
         handle_reset_bear_state()
 
-    if setup_tray_if_available():
-        return
-
     run_sync_loop()
+    close_app()
 
 
 if __name__ == "__main__":

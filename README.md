@@ -7,25 +7,15 @@
  - Requests
  - Selenium
  - img2pdf
- - pystray
  - schedule
- - tarfile
 
-## Getting Started
-Syncs Kindle Scribe notebooks using an android user agent to access the notebook files.
-Keeps a local record of the last update time. Runs a check every 5 minutes.
-Stores the files in a destination folder in PDF format.
+## Overview
+Syncs Kindle Scribe notebooks to local PDF files and optionally into Bear Notes.
+Runs as a headless background daemon — no GUI or dock icon.
+Intended to be installed as a macOS launchd agent that starts automatically at login.
 
-Using `pystray` to have a "Force Sync" and "Last Update" button in the system tray.
-
-![Kindle Scribe Sync Screenshot](https://github.com/Koloss5421/KindleScribeSync/blob/main/docs/screenshot.png?raw=true)
-
-This now supports both macOS and Windows.
-You must authenticate through the selenium browser, 2 min timeout when it opens.
-The cookies are then saved for use later by requests.
-
-There may be some bugs. Not sure how much I will maintain it.
-No Longer have a Kindle Scribe to test with.
+You must authenticate through the Selenium browser window the first time.
+Cookies are saved and reused for subsequent runs.
 
 ## Installation
 
@@ -39,14 +29,9 @@ Setup virtual environment
 python3 -m venv ./venv
 ```
 
-Activate virtual environment (macOS / Linux)
+Activate virtual environment
 ```
 source ./venv/bin/activate
-```
-
-Activate virtual environment (Windows)
-```
-./venv/Scripts/activate
 ```
 
 Install requirements
@@ -54,42 +39,71 @@ Install requirements
 pip install -r requirements.txt
 ```
 
-Run it!
+## Configuration
+
+Copy the example config and edit it before first run:
+```
+cp config.json.example config.json
+```
+
+`config.json` options:
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `update_minutes` | int | 30 | How often to check for notebook changes |
+| `bear_sync` | bool | false | Sync updated PDFs into Bear Notes |
+| `bear_dry_run` | bool | false | Log Bear x-callback URLs without opening them |
+| `bear_force_resync` | bool | false | Recreate all Bear notes even if already synced |
+
+CLI flags always override config file values. `config.json` is gitignored; use `config.json.example` as the template to commit.
+
+> **Migrating from settings.json**: if you had a `settings.json` from a previous version, copy its values into `config.json` using the key names above.
+
+## Running
+
+Run one sync pass (useful for testing)
+```
+python KindleScribeSync.py --once
+```
+
+Run in continuous mode (syncs on the configured interval)
 ```
 python KindleScribeSync.py
 ```
 
-Run one sync pass without tray UI (useful for terminal-only environments)
+Override the sync interval at the command line
 ```
-python KindleScribeSync.py --once --no-tray
-```
-
-Sync updated notebooks into Bear Notes (macOS)
-```
-python KindleScribeSync.py --bear-sync
+python KindleScribeSync.py --update-minutes 15
 ```
 
-Run Bear sync once without tray (recommended for manual plug-in syncs)
+Sync updated notebooks into Bear Notes
 ```
-python KindleScribeSync.py --once --no-tray --bear-sync
+python KindleScribeSync.py --once --bear-sync
 ```
 
 Force Bear note recreation even when local sync state says notes are already current
 ```
-python KindleScribeSync.py --once --no-tray --bear-sync --bear-force-resync
+python KindleScribeSync.py --once --bear-sync --bear-force-resync
 ```
 
-Clear local Bear sync markers before a run
+Clear local Bear sync markers before a run (Bear notes will be recreated)
 ```
-python KindleScribeSync.py --once --no-tray --bear-sync --reset-bear-state
+python KindleScribeSync.py --once --bear-sync --reset-bear-state
 ```
 
-Install the app as a macOS launch agent so the menubar app starts automatically at login
+Dry-run Bear calls to preview x-callback URLs without opening Bear
+```
+python KindleScribeSync.py --once --bear-sync --bear-dry-run
+```
+
+## launchd (Run at Login)
+
+Install as a macOS launch agent (starts at login, restarts on crash)
 ```
 python KindleScribeSync.py --launchd-install
 ```
 
-Check whether the launch agent is installed
+Check whether the launch agent is installed and loaded
 ```
 python KindleScribeSync.py --launchd-status
 ```
@@ -99,37 +113,26 @@ Remove the launch agent
 python KindleScribeSync.py --launchd-remove
 ```
 
-Dry-run Bear calls to preview x-callback URLs
-```
-python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
-```
+The plist is written to `~/Library/LaunchAgents/com.github.kindlescribesync.plist`.
+Application logs are written to `~/Library/Logs/KindleScribeSync/KindleScribeSync.log`.
+launchd stdout/stderr are written to `~/Library/Logs/KindleScribeSync/launchd.out.log` and `~/Library/Logs/KindleScribeSync/launchd.err.log`.
+After changing `config.json`, run `--launchd-remove` then `--launchd-install` to reload.
 
 ## Bear Notes Sync Behavior
 
-- Bear sync is optional and enabled only with `--bear-sync`.
+- Bear sync is disabled by default; enable it with `"bear_sync": true` in `config.json` or `--bear-sync`.
 - A root tag `#scribe` is applied to all synced notes.
-- A subtag is generated from notebook path, for example `#scribe/work`.
-- Bear note titles use the plain notebook name when it is unique.
+- A subtag is generated from the notebook path, for example `#scribe/work`.
+- Bear note titles use the plain notebook name when it is unique across all notebooks.
 - When notebook names collide in different folders, the title falls back to a path-based name such as `Work / Daily Work Notes`.
-- On first sync for a notebook, the note is created in Bear with the exported PDF attached.
-- On subsequent syncs, the previous Bear note is replaced with a fresh note containing the latest attached PDF.
+- On first sync, the note is created in Bear with the exported PDF attached.
+- On subsequent syncs, the previous Bear note is replaced with a fresh note containing the latest PDF.
 - If a local PDF export is missing, the script regenerates it even when the remote notebook has not changed.
-- If Bear notes were deleted manually, use `--bear-force-resync` to recreate them from current local exports.
-- If you want to clear only the local Bear sync markers first, use `--reset-bear-state`.
-
-## Menubar And Launchd
-
-- On macOS, the tray icon acts as a menubar app.
-- The menubar menu shows the last sync time and current sync interval.
-- You can trigger a manual sync from the menubar.
-- You can change the sync interval from the menubar; the choice is saved in `settings.json`.
-- You can reset local Bear sync state from the menubar.
-- You can install, remove, and check the launch agent from the menubar or CLI.
-- The launch agent starts the menubar app automatically at login; the app itself manages the sync frequency.
+- If Bear notes were deleted manually, run with `--bear-force-resync` to recreate them.
+- To wipe only the local sync markers (not trigger a PDF re-render), use `--reset-bear-state`.
 
 Each Bear note includes:
 - Notebook path
-- Source path
 - Last sync timestamp
 - Attached PDF export
 
