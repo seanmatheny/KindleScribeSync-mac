@@ -2,6 +2,7 @@ debug.log
 cookies.pkl
 notebooks.json
 settings.json
+kindlescribesync.lock
 venv/
 kindle_notebooks/
 extraction/

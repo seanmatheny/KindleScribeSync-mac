@@ -33,6 +33,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +65,7 @@ COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 2
 SETTINGS_FILE = "settings.json"
+LOCK_FILE = "kindlescribesync.lock"
 LAUNCH_AGENT_LABEL = "com.github.kindlescribesync"
 INTERVAL_OPTIONS = (5, 15, 30, 60, 180)
 
@@ -106,10 +108,62 @@ bear_sync_enabled = False
 bear_dry_run = False
 bear_force_resync = False
 notebook_name_counts = {}
+sync_thread = None
 app_settings = {
     "update_minutes": UPDATE_MINUTES,
     "bear_sync_enabled": False,
 }
+
+
+def get_lock_path():
+    return Path(__file__).resolve().parent / LOCK_FILE
+
+
+def acquire_single_instance_lock():
+    """
+    Write a PID lock file so only one instance runs at a time.
+    Returns True if the lock was acquired, False if another instance is already running.
+    """
+    lock_path = get_lock_path()
+    try:
+        if lock_path.exists():
+            try:
+                old_pid = int(lock_path.read_text().strip())
+                os.kill(old_pid, 0)  # raises OSError if process is gone
+                logger.warning("Another instance is already running (PID %s). Exiting.", old_pid)
+                return False
+            except (OSError, ValueError):
+                pass  # stale lock
+        lock_path.write_text(str(os.getpid()))
+        return True
+    except Exception as ex:
+        logger.warning("Could not acquire instance lock: %s", ex)
+        return True  # allow running if the lock mechanism itself fails
+
+
+def release_single_instance_lock():
+    try:
+        lock_path = get_lock_path()
+        if lock_path.exists():
+            lock_path.unlink()
+    except Exception:
+        pass
+
+
+def suppress_dock_icon():
+    """
+    Hide the Python dock icon so the app appears only in the menu bar.
+    pystray on macOS already pulls in pyobjc, so AppKit is always available
+    when pystray is importable.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        logger.info("Dock icon suppressed; running as menu bar app.")
+    except Exception as ex:
+        logger.warning("Could not suppress dock icon: %s", ex)
 
 
 def get_settings_path():
@@ -546,6 +600,7 @@ def close_app():
     running = False
     logger.info("Closing application")
     save_cookies()
+    release_single_instance_lock()
     if tray_icon is not None:
         tray_icon.stop()
     if driver is not None:
@@ -553,10 +608,31 @@ def close_app():
             driver.quit()
         except Exception:
             pass
-    try:
-        sys.exit()
-    except Exception:
-        pass
+
+
+def run_sync_loop():
+    logger.info("Running initial check")
+    check_notebooks()
+
+    if args is not None and args.once:
+        logger.info("Single-run mode complete")
+        close_app()
+        return
+
+    configure_schedule()
+    while running:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+def start_sync_thread(icon=None):
+    global sync_thread
+
+    if sync_thread is not None and sync_thread.is_alive():
+        return
+
+    sync_thread = threading.Thread(target=run_sync_loop, name="SyncLoop", daemon=True)
+    sync_thread.start()
 
 def update_info(icon, item):
     """
@@ -931,20 +1007,22 @@ def parse_args():
 def setup_tray_if_available():
     global tray_icon
     if not use_tray:
-        return
+        return False
     if pystray is None or Image is None:
         logger.warning("pystray/Pillow not available; running without tray.")
-        return
+        return False
 
     icon_path = Path(__file__).resolve().parent / "KindleScribeSyncIcon.png"
     if not icon_path.exists():
         logger.warning("Tray icon image not found; running without tray.")
-        return
+        return False
 
+    suppress_dock_icon()
     tray_image = Image.open(str(icon_path))
     tray_icon = pystray.Icon("Kindle Scribe Sync", tray_image, "Kindle Scribe Sync", build_tray_menu())
     logger.info("Running Tray Icon")
-    tray_icon.run_detached()
+    tray_icon.run(setup=start_sync_thread)
+    return True
 
 
 def main():
@@ -978,6 +1056,9 @@ def main():
         launch_agent_status()
         return
 
+    if not acquire_single_instance_lock():
+        sys.exit(1)
+
     if not os.path.exists(EXTRACT_PATH):
         os.mkdir(EXTRACT_PATH)
 
@@ -989,19 +1070,10 @@ def main():
     if args.reset_bear_state:
         handle_reset_bear_state()
 
-    setup_tray_if_available()
-
-    logger.info("Running initial check")
-    check_notebooks()
-
-    if args.once:
-        logger.info("Single-run mode complete")
+    if setup_tray_if_available():
         return
 
-    configure_schedule()
-    while running:
-        schedule.run_pending()
-        time.sleep(1)
+    run_sync_loop()
 
 
 if __name__ == "__main__":
