@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import pickle
+import plistlib
 import re
 import subprocess
 import sys
@@ -62,6 +63,9 @@ NOTEBOOK_JSON_PATH = "notebooks.json"
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 2
+SETTINGS_FILE = "settings.json"
+LAUNCH_AGENT_LABEL = "com.github.kindlescribesync"
+INTERVAL_OPTIONS = (5, 15, 30, 60, 180)
 
 ## Where to extract tar images
 EXTRACT_PATH = "extraction"
@@ -102,6 +106,213 @@ bear_sync_enabled = False
 bear_dry_run = False
 bear_force_resync = False
 notebook_name_counts = {}
+app_settings = {
+    "update_minutes": UPDATE_MINUTES,
+    "bear_sync_enabled": False,
+}
+
+
+def get_settings_path():
+    return Path(__file__).resolve().parent / SETTINGS_FILE
+
+
+def load_settings():
+    """
+    Load persisted app settings.
+    """
+    global app_settings
+    settings_path = get_settings_path()
+    if settings_path.exists():
+        try:
+            app_settings.update(json.loads(settings_path.read_text(encoding="utf-8")))
+        except Exception as ex:
+            logger.warning("Failed to load settings file %s: %s", settings_path, ex)
+
+
+def save_settings():
+    """
+    Persist app settings for future runs and launchd startup.
+    """
+    settings_path = get_settings_path()
+    settings_path.write_text(json.dumps(app_settings, indent=2), encoding="utf-8")
+
+
+def get_launch_agent_path():
+    return Path.home() / "Library" / "LaunchAgents" / "{}.plist".format(LAUNCH_AGENT_LABEL)
+
+
+def notify(message, title="Kindle Scribe Sync"):
+    if tray_icon is not None:
+        try:
+            tray_icon.notify(message, title)
+        except Exception:
+            logger.info("Notification: %s - %s", title, message)
+    else:
+        logger.info("Notification: %s - %s", title, message)
+
+
+def refresh_tray_menu():
+    if tray_icon is not None:
+        tray_icon.menu = build_tray_menu()
+        try:
+            tray_icon.update_menu()
+        except Exception:
+            pass
+
+
+def build_launch_agent_plist():
+    script_path = str(Path(__file__).resolve())
+    python_path = sys.executable
+    return {
+        "Label": LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [python_path, script_path],
+        "WorkingDirectory": str(Path(__file__).resolve().parent),
+        "LimitLoadToSessionType": ["Aqua"],
+        "RunAtLoad": True,
+        "ProcessType": "Interactive",
+        "StandardOutPath": str((Path(__file__).resolve().parent / "debug.log").resolve()),
+        "StandardErrorPath": str((Path(__file__).resolve().parent / "debug.log").resolve()),
+    }
+
+
+def run_launchctl(arguments):
+    result = subprocess.run(["launchctl", *arguments], capture_output=True, text=True)
+    if result.stdout.strip():
+        logger.info("launchctl stdout: %s", result.stdout.strip())
+    if result.stderr.strip():
+        logger.info("launchctl stderr: %s", result.stderr.strip())
+    return result
+
+
+def bootout_launch_agent(plist_path):
+    domain = "gui/{}".format(os.getuid())
+    result = run_launchctl(["bootout", domain, str(plist_path)])
+    if result.returncode == 0:
+        return True
+
+    stderr = (result.stderr or "").lower()
+    if "boot-out failed: 5" in stderr or "could not find specified service" in stderr:
+        logger.info("Launch agent was not loaded; continuing.")
+        return True
+
+    return False
+
+
+def install_launch_agent(icon=None, item=None):
+    plist_path = get_launch_agent_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(plist_path, "wb") as handle:
+        plistlib.dump(build_launch_agent_plist(), handle)
+
+    if not bootout_launch_agent(plist_path):
+        notify("Launch agent install failed while unloading previous job. See debug.log for details.")
+        return
+
+    domain = "gui/{}".format(os.getuid())
+    result = run_launchctl(["bootstrap", domain, str(plist_path)])
+    if result.returncode == 0:
+        notify("Launch agent installed. App will start automatically at login.")
+    else:
+        notify("Launch agent install failed. See debug.log for details.")
+
+
+def remove_launch_agent(icon=None, item=None):
+    plist_path = get_launch_agent_path()
+    if plist_path.exists() and not bootout_launch_agent(plist_path):
+        notify("Launch agent removal failed. See debug.log for details.")
+        return
+
+    if plist_path.exists():
+        plist_path.unlink()
+    notify("Launch agent removed.")
+
+
+def launch_agent_status(icon=None, item=None):
+    plist_path = get_launch_agent_path()
+    if not plist_path.exists():
+        notify("Launch agent is not installed.")
+        return
+
+    domain_target = "gui/{}/{}".format(os.getuid(), LAUNCH_AGENT_LABEL)
+    result = run_launchctl(["print", domain_target])
+    if result.returncode == 0:
+        notify("Launch agent is installed and loaded.")
+    else:
+        notify("Launch agent plist exists but is not currently loaded.")
+
+
+def reset_bear_sync_state(items):
+    """
+    Clear persisted Bear sync markers so notes can be recreated from scratch.
+    """
+    if isinstance(items, dict):
+        iterable = items.values()
+    else:
+        iterable = items
+
+    for entry in iterable:
+        if isinstance(entry, dict):
+            entry["bearCreated"] = False
+            entry["bearTitle"] = None
+            entry["bearSyncVersion"] = 0
+            if "items" in entry:
+                reset_bear_sync_state(entry["items"])
+
+
+def handle_reset_bear_state(icon=None, item=None):
+    reset_bear_sync_state(notebooks)
+    save_notebook_json()
+    notify("Reset local Bear sync state. The next Bear sync will recreate notes.")
+
+
+def trigger_sync(icon=None, item=None):
+    check_notebooks()
+    refresh_tray_menu()
+
+
+def configure_schedule():
+    schedule.clear("sync")
+    schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks).tag("sync")
+    logger.info("Scheduled sync every %s minutes", UPDATE_MINUTES)
+
+
+def set_update_interval(minutes):
+    def callback(icon=None, item=None):
+        global UPDATE_MINUTES
+        UPDATE_MINUTES = minutes
+        app_settings["update_minutes"] = minutes
+        save_settings()
+        configure_schedule()
+        notify("Sync interval set to {} minutes.".format(minutes))
+        refresh_tray_menu()
+
+    return callback
+
+
+def build_interval_menu():
+    return pystray.Menu(*[
+        pystray.MenuItem(
+            "{} minutes".format(minutes),
+            set_update_interval(minutes),
+            checked=lambda item, target=minutes: app_settings.get("update_minutes", UPDATE_MINUTES) == target,
+            radio=True,
+        )
+        for minutes in INTERVAL_OPTIONS
+    ])
+
+
+def build_tray_menu():
+    return pystray.Menu(
+        pystray.MenuItem(lambda item: "Last Sync: {}".format(last_update), None, enabled=False),
+        pystray.MenuItem(lambda item: "Interval: {} min".format(app_settings.get("update_minutes", UPDATE_MINUTES)), None, enabled=False),
+        pystray.MenuItem('Sync Now', trigger_sync),
+        pystray.MenuItem('Sync Interval', build_interval_menu()),
+        pystray.MenuItem('Reset Bear State', handle_reset_bear_state),
+        pystray.MenuItem('Install Launch Agent', install_launch_agent),
+        pystray.MenuItem('Remove Launch Agent', remove_launch_agent),
+        pystray.MenuItem('Launch Agent Status', launch_agent_status),
+        pystray.MenuItem('Quit', close_app)
+    )
 
 
 def slugify_tag_part(value):
@@ -697,6 +908,7 @@ def check_notebooks():
 
     now = datetime.now()
     last_update = now.strftime("%m/%d/%Y, %H:%M:%S")
+    refresh_tray_menu()
 
     logger.info("Will Check again in {} minutes...".format(UPDATE_MINUTES))
 
@@ -708,7 +920,11 @@ def parse_args():
     parser.add_argument("--bear-sync", action="store_true", help="Sync updated notebook exports to Bear notes using x-callback-url (macOS only).")
     parser.add_argument("--bear-dry-run", action="store_true", help="Print Bear x-callback URLs without opening them.")
     parser.add_argument("--bear-force-resync", action="store_true", help="Recreate Bear notes even when local sync state says they are already current.")
-    parser.add_argument("--update-minutes", type=int, default=UPDATE_MINUTES, help="Minutes between sync checks when running continuously.")
+    parser.add_argument("--reset-bear-state", action="store_true", help="Clear local Bear sync markers before syncing.")
+    parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
+    parser.add_argument("--launchd-remove", action="store_true", help="Remove the macOS launch agent.")
+    parser.add_argument("--launchd-status", action="store_true", help="Print whether the macOS launch agent is installed.")
+    parser.add_argument("--update-minutes", type=int, default=None, help="Minutes between sync checks when running continuously.")
     return parser.parse_args()
 
 
@@ -725,14 +941,8 @@ def setup_tray_if_available():
         logger.warning("Tray icon image not found; running without tray.")
         return
 
-    menu = pystray.Menu(
-        pystray.MenuItem('Last Update', update_info),
-        pystray.MenuItem('Force Sync', check_notebooks),
-        pystray.MenuItem('Quit', close_app)
-    )
-
     tray_image = Image.open(str(icon_path))
-    tray_icon = pystray.Icon("Kindle Scribe Sync", tray_image, "Kindle Scribe Sync", menu)
+    tray_icon = pystray.Icon("Kindle Scribe Sync", tray_image, "Kindle Scribe Sync", build_tray_menu())
     logger.info("Running Tray Icon")
     tray_icon.run_detached()
 
@@ -746,11 +956,27 @@ def main():
     global bear_force_resync
 
     args = parse_args()
-    UPDATE_MINUTES = max(args.update_minutes, 1)
+    load_settings()
+
+    configured_minutes = args.update_minutes if args.update_minutes is not None else app_settings.get("update_minutes", UPDATE_MINUTES)
+    UPDATE_MINUTES = max(configured_minutes, 1)
+    app_settings["update_minutes"] = UPDATE_MINUTES
     use_tray = not args.no_tray
-    bear_sync_enabled = args.bear_sync
+    bear_sync_enabled = args.bear_sync or app_settings.get("bear_sync_enabled", False)
     bear_dry_run = args.bear_dry_run
     bear_force_resync = args.bear_force_resync
+    app_settings["bear_sync_enabled"] = bear_sync_enabled
+    save_settings()
+
+    if args.launchd_install:
+        install_launch_agent()
+        return
+    if args.launchd_remove:
+        remove_launch_agent()
+        return
+    if args.launchd_status:
+        launch_agent_status()
+        return
 
     if not os.path.exists(EXTRACT_PATH):
         os.mkdir(EXTRACT_PATH)
@@ -759,6 +985,10 @@ def main():
     os.makedirs(SYNC_PATH, exist_ok=True)
 
     load_notebook_json()
+
+    if args.reset_bear_state:
+        handle_reset_bear_state()
+
     setup_tray_if_available()
 
     logger.info("Running initial check")
@@ -768,7 +998,7 @@ def main():
         logger.info("Single-run mode complete")
         return
 
-    schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks)
+    configure_schedule()
     while running:
         schedule.run_pending()
         time.sleep(1)

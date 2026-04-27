@@ -79,6 +79,26 @@ Force Bear note recreation even when local sync state says notes are already cur
 python KindleScribeSync.py --once --no-tray --bear-sync --bear-force-resync
 ```
 
+Clear local Bear sync markers before a run
+```
+python KindleScribeSync.py --once --no-tray --bear-sync --reset-bear-state
+```
+
+Install the app as a macOS launch agent so the menubar app starts automatically at login
+```
+python KindleScribeSync.py --launchd-install
+```
+
+Check whether the launch agent is installed
+```
+python KindleScribeSync.py --launchd-status
+```
+
+Remove the launch agent
+```
+python KindleScribeSync.py --launchd-remove
+```
+
 Dry-run Bear calls to preview x-callback URLs
 ```
 python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
@@ -95,6 +115,17 @@ python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
 - On subsequent syncs, the previous Bear note is replaced with a fresh note containing the latest attached PDF.
 - If a local PDF export is missing, the script regenerates it even when the remote notebook has not changed.
 - If Bear notes were deleted manually, use `--bear-force-resync` to recreate them from current local exports.
+- If you want to clear only the local Bear sync markers first, use `--reset-bear-state`.
+
+## Menubar And Launchd
+
+- On macOS, the tray icon acts as a menubar app.
+- The menubar menu shows the last sync time and current sync interval.
+- You can trigger a manual sync from the menubar.
+- You can change the sync interval from the menubar; the choice is saved in `settings.json`.
+- You can reset local Bear sync state from the menubar.
+- You can install, remove, and check the launch agent from the menubar or CLI.
+- The launch agent starts the menubar app automatically at login; the app itself manages the sync frequency.
 
 Each Bear note includes:
 - Notebook path

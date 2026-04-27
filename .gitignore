@@ -1,6 +1,7 @@
 debug.log
 cookies.pkl
 notebooks.json
+settings.json
 venv/
 kindle_notebooks/
 extraction/
