@@ -59,6 +59,7 @@ UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 3
 CONFIG_FILE = "config.json"
 LOCK_FILE = "kindlescribesync.lock"
+MANUAL_SYNC_REQUEST_FILE = "kindlescribesync.manual-sync.request"
 LAUNCH_AGENT_LABEL = "com.github.kindlescribesync"
 LOG_DIR = Path.home() / "Library" / "Logs" / "KindleScribeSync"
 APP_LOG_FILE = LOG_DIR / "KindleScribeSync.log"
@@ -116,6 +117,10 @@ def get_lock_path():
     return Path(__file__).resolve().parent / LOCK_FILE
 
 
+def get_manual_sync_request_path():
+    return Path(__file__).resolve().parent / MANUAL_SYNC_REQUEST_FILE
+
+
 def acquire_single_instance_lock():
     """
     Write a PID lock file so only one instance runs at a time.
@@ -145,6 +150,48 @@ def release_single_instance_lock():
             lock_path.unlink()
     except Exception:
         pass
+
+
+def request_manual_sync_from_running_instance():
+    """
+    Signal an already-running instance to perform an immediate sync pass.
+    """
+    request_path = get_manual_sync_request_path()
+    payload = {
+        "requested_at": datetime.now().isoformat(timespec="seconds"),
+        "requested_by_pid": os.getpid(),
+    }
+    try:
+        request_path.write_text(json.dumps(payload), encoding="utf-8")
+        logger.info("Queued manual sync request for running instance: %s", request_path)
+        return True
+    except Exception as ex:
+        logger.error("Failed to queue manual sync request: %s", ex)
+        return False
+
+
+def process_pending_manual_sync_request():
+    """
+    Handle a one-shot manual sync request written by a CLI --once invocation.
+    """
+    request_path = get_manual_sync_request_path()
+    if not request_path.exists():
+        return
+
+    payload_text = ""
+    try:
+        payload_text = request_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+
+    logger.info("Processing queued manual sync request: %s", payload_text or "(no payload)")
+
+    try:
+        request_path.unlink(missing_ok=True)
+    except Exception as ex:
+        logger.warning("Could not clear manual sync request file: %s", ex)
+
+    check_notebooks()
 
 
 def get_config_path():
@@ -570,6 +617,7 @@ def run_sync_loop():
 
     configure_schedule()
     while running:
+        process_pending_manual_sync_request()
         schedule.run_pending()
         time.sleep(1)
 
@@ -986,6 +1034,9 @@ def main():
         return
 
     if not acquire_single_instance_lock():
+        if args.once and request_manual_sync_from_running_instance():
+            logger.info("Another instance is active; queued one manual sync request and exiting.")
+            return
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, handle_signal)

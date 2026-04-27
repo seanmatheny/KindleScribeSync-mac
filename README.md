@@ -66,6 +66,8 @@ Run one sync pass (useful for testing)
 python KindleScribeSync.py --once
 ```
 
+If the launchd agent is already running, the same command queues an immediate one-shot sync request for the running background instance and exits.
+
 Run in continuous mode (syncs on the configured interval)
 ```
 python KindleScribeSync.py
