@@ -454,19 +454,110 @@ def bear_open_xurl(action, params):
         return False
 
 
+def bear_delete_note_by_title(title, reason):
+    """
+    Delete a Bear note by exact title using AppleScript.
+    Returns True if the delete command succeeded, False otherwise.
+    """
+    if not title:
+        logger.warning("Cannot delete Bear note: no title provided")
+        return False
+
+    if bear_dry_run:
+        logger.info("Bear dry-run: would delete note with title '%s'", title)
+        return True
+
+    try:
+        # Escape single quotes in the title for AppleScript
+        escaped_title = title.replace("'", "'\"'\"'")
+        applescript = (
+            "tell application \"Bear\"\n"
+            "  try\n"
+            "    move (first note where title is equal to '{}') to trash\n"
+            "    return true\n"
+            "  on error\n"
+            "    return false\n"
+            "  end try\n"
+            "end tell\n"
+        ).format(escaped_title)
+        result = subprocess.run(
+            ["osascript", "-e", applescript],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        success = result.returncode == 0 and "true" in result.stdout.lower()
+        if success:
+            logger.info("Successfully deleted Bear note '%s' via AppleScript for reason='%s'", title, reason)
+        else:
+            logger.warning("AppleScript delete for '%s' failed or returned no match (reason='%s')", title, reason)
+        return success
+    except Exception as ex:
+        logger.error("AppleScript delete failed for '%s': %s", title, ex)
+        return False
+
+
+def bear_delete_note_by_marker(marker, reason):
+    """
+    Delete a Bear note by marker search using AppleScript.
+    Returns True if the delete command succeeded, False otherwise.
+    """
+    if not marker:
+        logger.warning("Cannot delete Bear note: no marker provided")
+        return False
+
+    if bear_dry_run:
+        logger.info("Bear dry-run: would search for and delete note with marker '%s'", marker)
+        return True
+
+    try:
+        # Search for notes containing the marker, then delete them
+        applescript = (
+            "tell application \"Bear\"\n"
+            "  try\n"
+            "    set notesToDelete to notes where body contains \"{}\"\n"
+            "    repeat with noteToDelete in notesToDelete\n"
+            "      move noteToDelete to trash\n"
+            "    end repeat\n"
+            "    return true\n"
+            "  on error\n"
+            "    return false\n"
+            "  end try\n"
+            "end tell\n"
+        ).format(marker)
+        result = subprocess.run(
+            ["osascript", "-e", applescript],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        success = result.returncode == 0 and "true" in result.stdout.lower()
+        if success:
+            logger.info("Successfully deleted Bear notes with marker '%s' via AppleScript for reason='%s'", marker, reason)
+        else:
+            logger.warning("AppleScript delete by marker '%s' failed or returned no match (reason='%s')", marker, reason)
+        return success
+    except Exception as ex:
+        logger.error("AppleScript delete by marker failed for '%s': %s", marker, ex)
+        return False
+
+
 def bear_trash_note(*, reason, title=None, search_term=None):
     """
-    Trash a Bear note using Bear's supported trash keys (id/search).
+    Trash a Bear note using AppleScript for direct, reliable deletion.
     """
     if title:
-        # /trash accepts only id/search; quoted title behaves like an exact phrase search.
-        title_search = '"{}"'.format(title)
-        logger.info("Attempting Bear trash for reason='%s' title-search=%s", reason, title_search)
-        return bear_open_xurl("trash", {"search": title_search, "show_window": "no"})
+        logger.info("Attempting Bear delete by title for reason='%s' title='%s'", reason, title)
+        return bear_delete_note_by_title(title, reason)
     if search_term:
-        logger.info("Attempting Bear trash for reason='%s' search='%s'", reason, search_term)
-        return bear_open_xurl("trash", {"search": search_term, "show_window": "no"})
-    logger.warning("Skipping Bear trash for reason='%s'; no title or search term", reason)
+        # Use marker search if it looks like our sync marker
+        if "kindle-scribe-sync-id:" in search_term:
+            logger.info("Attempting Bear delete by marker for reason='%s' marker='%s'", reason, search_term)
+            return bear_delete_note_by_marker(search_term, reason)
+        # Otherwise try title search
+        logger.info("Attempting Bear delete by content search for reason='%s' search='%s'", reason, search_term)
+        return bear_delete_note_by_marker(search_term, reason)
+    logger.warning("Skipping Bear delete for reason='%s'; no title or search term", reason)
     return False
 
 
