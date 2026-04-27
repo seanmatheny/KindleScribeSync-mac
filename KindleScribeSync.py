@@ -100,6 +100,8 @@ args = None
 tray_icon = None
 bear_sync_enabled = False
 bear_dry_run = False
+bear_force_resync = False
+notebook_name_counts = {}
 
 
 def slugify_tag_part(value):
@@ -123,6 +125,23 @@ def build_bear_tags(notebook_path):
     return ["scribe", "scribe/{}".format("/".join(parts))]
 
 
+def collect_notebook_name_counts(items, counts=None):
+    """
+    Count notebook names in the current Kindle tree so unique names can use plain Bear titles.
+    """
+    if counts is None:
+        counts = {}
+
+    for item in items:
+        if item.get("type") == "folder":
+            collect_notebook_name_counts(item.get("items", []), counts)
+        elif item.get("type") == "notebook":
+            title = item.get("title", "Untitled Notebook")
+            counts[title] = counts.get(title, 0) + 1
+
+    return counts
+
+
 def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
     """
     Backfill state fields for notebook entries created before Bear sync support existed.
@@ -135,10 +154,13 @@ def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
         notebook_meta["bearSyncVersion"] = 0
 
 
-def build_bear_note_title(notebook_path):
+def build_bear_note_title(notebook_name, notebook_path):
     """
-    Build a human-readable, path-based note title to avoid collisions.
+    Use the plain notebook name when unique, else fall back to a path-based title.
     """
+    if notebook_name_counts.get(notebook_name, 0) <= 1:
+        return notebook_name
+
     parts = [part for part in notebook_path.split(os.sep) if part]
     return " / ".join(parts) if parts else "Untitled Notebook"
 
@@ -213,7 +235,7 @@ def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebo
     tags = build_bear_tags(notebook_path)
     marker = build_bear_marker(notebook_id)
     previous_bear_title = notebook_meta.get("bearTitle")
-    bear_title = build_bear_note_title(notebook_path)
+    bear_title = build_bear_note_title(notebook_name, notebook_path)
     notebook_meta["bearTitle"] = bear_title
     note_text = (
         "Notebook Path: {}\n"
@@ -430,7 +452,7 @@ def iterate_notebooks(obj, parentObj):
                 'updateTime': 0,
                 'items': {},
                 'bearCreated': False,
-                'bearTitle': "Scribe {}".format(id),
+                'bearTitle': None,
             }
         else:
             ensure_notebook_tracking_defaults(id, parentItems[id])
@@ -448,25 +470,29 @@ def iterate_notebooks(obj, parentObj):
             modification_time = nb_data['metadata']['modificationTime']
             current_update_time = parentItems[id]['updateTime']
             pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(parentItems[id]['path']))
-            desired_bear_title = build_bear_note_title(parentItems[id]['path'])
-            should_render_pdf = modification_time > current_update_time
+            desired_bear_title = build_bear_note_title(parentItems[id]['name'], parentItems[id]['path'])
+            pdf_missing = not os.path.exists(pdf_path)
+            should_render_pdf = modification_time > current_update_time or pdf_missing
             should_seed_bear = (
                 bear_sync_enabled
                 and os.path.exists(pdf_path)
                 and (
-                    not parentItems[id].get('bearCreated', False)
+                    bear_force_resync
+                    or not parentItems[id].get('bearCreated', False)
                     or parentItems[id].get('bearTitle') != desired_bear_title
                     or parentItems[id].get('bearSyncVersion', 0) < BEAR_SYNC_VERSION
                 )
             )
 
             logger.info(
-                "Notebook '%s': remote_modification=%s local_update=%s should_render_pdf=%s should_seed_bear=%s bear_title=%s bear_version=%s",
+                "Notebook '%s': remote_modification=%s local_update=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s",
                 parentItems[id]['name'],
                 modification_time,
                 current_update_time,
+                pdf_missing,
                 should_render_pdf,
                 should_seed_bear,
+                bear_force_resync,
                 parentItems[id].get('bearTitle'),
                 parentItems[id].get('bearSyncVersion', 0),
             )
@@ -489,8 +515,8 @@ def iterate_notebooks(obj, parentObj):
                 global update_count
                 update_count += 1
                 parentItems[id]['updateTime'] = int(time.time())
-            elif should_seed_bear:
-                logger.info("Skipping PDF render for '%s'; reusing existing PDF for initial Bear sync", parentItems[id]['name'])
+            elif should_seed_bear and os.path.exists(pdf_path):
+                logger.info("Skipping PDF render for '%s'; reusing existing PDF for Bear sync", parentItems[id]['name'])
                 sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
             elif bear_sync_enabled:
                 logger.info("Skipping Bear sync for '%s'; no PDF changes and Bear note already tracked", parentItems[id]['name'])
@@ -543,6 +569,7 @@ def get_all_notebooks():
     """
     logger.info("Getting all notebooks")
     global cookies
+    global notebook_name_counts
     global session
     while True:
         resp = session.get(URL_GET_NOTEBOOKS)
@@ -553,6 +580,7 @@ def get_all_notebooks():
             break
     cookies = requests.utils.dict_from_cookiejar(session.cookies)
     data = resp.json()
+    notebook_name_counts = collect_notebook_name_counts(data['itemsList'])
     iterate_notebooks(data['itemsList'], notebooks)
     prune_orphans(notebooks, data['itemsList'])
     save_notebook_json()
@@ -679,6 +707,7 @@ def parse_args():
     parser.add_argument("--no-tray", action="store_true", help="Disable system tray integration.")
     parser.add_argument("--bear-sync", action="store_true", help="Sync updated notebook exports to Bear notes using x-callback-url (macOS only).")
     parser.add_argument("--bear-dry-run", action="store_true", help="Print Bear x-callback URLs without opening them.")
+    parser.add_argument("--bear-force-resync", action="store_true", help="Recreate Bear notes even when local sync state says they are already current.")
     parser.add_argument("--update-minutes", type=int, default=UPDATE_MINUTES, help="Minutes between sync checks when running continuously.")
     return parser.parse_args()
 
@@ -714,12 +743,14 @@ def main():
     global args
     global bear_sync_enabled
     global bear_dry_run
+    global bear_force_resync
 
     args = parse_args()
     UPDATE_MINUTES = max(args.update_minutes, 1)
     use_tray = not args.no_tray
     bear_sync_enabled = args.bear_sync
     bear_dry_run = args.bear_dry_run
+    bear_force_resync = args.bear_force_resync
 
     if not os.path.exists(EXTRACT_PATH):
         os.mkdir(EXTRACT_PATH)

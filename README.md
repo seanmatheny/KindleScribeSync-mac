@@ -74,6 +74,11 @@ Run Bear sync once without tray (recommended for manual plug-in syncs)
 python KindleScribeSync.py --once --no-tray --bear-sync
 ```
 
+Force Bear note recreation even when local sync state says notes are already current
+```
+python KindleScribeSync.py --once --no-tray --bear-sync --bear-force-resync
+```
+
 Dry-run Bear calls to preview x-callback URLs
 ```
 python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
@@ -84,10 +89,12 @@ python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
 - Bear sync is optional and enabled only with `--bear-sync`.
 - A root tag `#scribe` is applied to all synced notes.
 - A subtag is generated from notebook path, for example `#scribe/work`.
-- Bear note titles use a human-readable notebook path, for example `Work / Daily Work Notes`.
-- When notebook names collide in different folders, the path-based title keeps them distinct.
+- Bear note titles use the plain notebook name when it is unique.
+- When notebook names collide in different folders, the title falls back to a path-based name such as `Work / Daily Work Notes`.
 - On first sync for a notebook, the note is created in Bear with the exported PDF attached.
 - On subsequent syncs, the previous Bear note is replaced with a fresh note containing the latest attached PDF.
+- If a local PDF export is missing, the script regenerates it even when the remote notebook has not changed.
+- If Bear notes were deleted manually, use `--bear-force-resync` to recreate them from current local exports.
 
 Each Bear note includes:
 - Notebook path
