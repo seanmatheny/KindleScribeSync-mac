@@ -3,7 +3,7 @@
 ![Kindle Scribe Sync Icon](https://github.com/Koloss5421/KindleScribeSync/blob/main/KindleScribeSyncIcon.png?raw=true)
 
 ### Built with
- - Python 3.13
+ - Python 3.14+
  - Requests
  - Selenium
  - img2pdf
@@ -12,7 +12,7 @@
  - tarfile
 
 ## Getting Started
-Syncs Kindle Scribe notebooks using an android user agent to access the notebook files. 
+Syncs Kindle Scribe notebooks using an android user agent to access the notebook files.
 Keeps a local record of the last update time. Runs a check every 5 minutes.
 Stores the files in a destination folder in PDF format.
 
@@ -20,7 +20,7 @@ Using `pystray` to have a "Force Sync" and "Last Update" button in the system tr
 
 ![Kindle Scribe Sync Screenshot](https://github.com/Koloss5421/KindleScribeSync/blob/main/docs/screenshot.png?raw=true)
 
-This is currently only made for running on windows. 
+This now supports both macOS and Windows.
 You must authenticate through the selenium browser, 2 min timeout when it opens.
 The cookies are then saved for use later by requests.
 
@@ -39,7 +39,12 @@ Setup virtual environment
 python3 -m venv ./venv
 ```
 
-Active virtual environment
+Activate virtual environment (macOS / Linux)
+```
+source ./venv/bin/activate
+```
+
+Activate virtual environment (Windows)
 ```
 ./venv/Scripts/activate
 ```
@@ -51,6 +56,11 @@ pip install -r requirements.txt
 
 Run it!
 ```
-python .\KindleScribeSync.py
+python KindleScribeSync.py
+```
+
+Run one sync pass without tray UI (useful for terminal-only environments)
+```
+python KindleScribeSync.py --once --no-tray
 ```
 
