@@ -381,7 +381,13 @@ def bear_open_xurl(action, params):
     query = urlencode(params, quote_via=quote, safe=",")
     url = "bear://x-callback-url/{}?{}".format(action, query)
     logger.info("Bear sync action: %s", action)
-    logger.info("Bear sync params: title=%s tags=%s", params.get("title"), params.get("tags"))
+    logger.info(
+        "Bear sync params: title=%s search=%s identifier=%s tags=%s",
+        params.get("title"),
+        params.get("search"),
+        params.get("id") or params.get("identifier"),
+        params.get("tags"),
+    )
     logger.info("Bear URL length: %s", len(url))
     if bear_dry_run:
         logger.info("Bear dry-run URL: %s", url)
@@ -398,12 +404,18 @@ def bear_open_xurl(action, params):
         return False
 
 
-def bear_trash_note(search_term, reason):
+def bear_trash_note(*, reason, title=None, search_term=None):
     """
-    Trash a Bear note using a unique search term.
+    Trash a Bear note by exact title or fallback search term.
     """
-    logger.info("Attempting Bear trash for reason='%s' search='%s'", reason, search_term)
-    return bear_open_xurl("trash", {"search": search_term, "show_window": "no"})
+    if title:
+        logger.info("Attempting Bear trash for reason='%s' title='%s'", reason, title)
+        return bear_open_xurl("trash", {"title": title, "show_window": "no"})
+    if search_term:
+        logger.info("Attempting Bear trash for reason='%s' search='%s'", reason, search_term)
+        return bear_open_xurl("trash", {"search": search_term, "show_window": "no"})
+    logger.warning("Skipping Bear trash for reason='%s'; no title or search term", reason)
+    return False
 
 
 def trash_bear_for_notebook(notebook_id, notebook_meta, reason):
@@ -414,12 +426,19 @@ def trash_bear_for_notebook(notebook_id, notebook_meta, reason):
         return
 
     marker = build_bear_marker(notebook_id)
-    bear_trash_note(marker, "{}_marker".format(reason))
 
     previous_bear_title = notebook_meta.get("bearTitle")
     if previous_bear_title:
-        # Fallback for older notes where marker text may not have been searchable.
-        bear_trash_note(previous_bear_title, "{}_title_fallback".format(reason))
+        # Most reliable path: delete by exact stored Bear title.
+        bear_trash_note(title=previous_bear_title, reason="{}_title".format(reason))
+
+    # Fallback for any older notes that still need marker-based matching.
+    bear_trash_note(search_term=marker, reason="{}_marker".format(reason))
+
+    notebook_name = notebook_meta.get("name")
+    if notebook_name and notebook_name != previous_bear_title:
+        # Last-resort cleanup for legacy state where stored bearTitle may be missing/stale.
+        bear_trash_note(title=notebook_name, reason="{}_name_fallback".format(reason))
 
 
 def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
@@ -464,7 +483,7 @@ def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebo
     )
 
     if previous_bear_title and previous_bear_title != bear_title:
-        bear_trash_note(previous_bear_title, "migrate_title")
+        bear_trash_note(title=previous_bear_title, reason="migrate_title")
 
     # Always remove existing copies first so one notebook maps to one Bear note.
     trash_bear_for_notebook(notebook_id, notebook_meta, "refresh_existing_note")
