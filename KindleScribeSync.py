@@ -28,12 +28,14 @@ import logging
 import os
 import pickle
 import re
+import subprocess
 import sys
 import tarfile
 import time
 from datetime import datetime
 from pathlib import Path
 from shutil import rmtree
+from urllib.parse import quote, urlencode
 
 import img2pdf
 import requests
@@ -94,6 +96,89 @@ last_update = "No Updates"
 use_tray = True
 args = None
 tray_icon = None
+bear_sync_enabled = False
+bear_dry_run = False
+
+
+def slugify_tag_part(value):
+    """
+    Convert notebook title/path parts into Bear tag-safe slugs.
+    """
+    cleaned = sanitize_name(value).lower()
+    cleaned = re.sub(r"\s+", "-", cleaned)
+    cleaned = re.sub(r"[^a-z0-9_\-/]", "", cleaned)
+    cleaned = cleaned.strip("-/")
+    return cleaned or "untitled"
+
+
+def build_bear_tags(notebook_path):
+    """
+    Build tags like #scribe and #scribe/work/projects from notebook path.
+    """
+    parts = [slugify_tag_part(part) for part in notebook_path.split(os.sep) if part]
+    if not parts:
+        return ["scribe"]
+    return ["scribe", "scribe/{}".format("/".join(parts))]
+
+
+def bear_open_xurl(action, params):
+    """
+    Execute a Bear x-callback-url action via macOS `open`.
+    """
+    if sys.platform != "darwin":
+        logger.warning("Bear sync requested but this platform is not macOS; skipping")
+        return False
+
+    query = urlencode(params, quote_via=quote, safe=",")
+    url = "bear://x-callback-url/{}?{}".format(action, query)
+    logger.info("Bear sync action: %s", action)
+    if bear_dry_run:
+        logger.info("Bear dry-run URL: %s", url)
+        return True
+
+    try:
+        subprocess.run(["open", url], check=True)
+        return True
+    except Exception as ex:
+        logger.error("Bear x-callback open failed: %s", ex)
+        return False
+
+
+def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
+    """
+    Upsert notebook information to Bear.
+    Strategy: try replace_all by title; if it does not exist, create it.
+    """
+    if not bear_sync_enabled:
+        return
+
+    tags = build_bear_tags(notebook_path)
+    bear_title = notebook_meta.get("bearTitle") or "Scribe {}".format(notebook_id)
+    notebook_meta["bearTitle"] = bear_title
+    note_text = (
+        "# {}\\n\\n"
+        "Source Notebook ID: {}\\n"
+        "Source Notebook Path: {}\\n"
+        "Last Synced: {}\\n\\n"
+        "PDF Export: [Open PDF](file://{})\\n"
+    ).format(notebook_name, notebook_id, notebook_path, datetime.now().isoformat(timespec="seconds"), Path(pdf_path).resolve())
+
+    common = {
+        "title": bear_title,
+        "text": note_text,
+        "tags": ",".join(tags),
+        "open_note": "no",
+        "show_window": "no",
+    }
+
+    if notebook_meta.get("bearCreated", False):
+        # replace_all keeps the note title untouched and updates the body incrementally on each sync.
+        bear_open_xurl("add-text", {**common, "mode": "replace_all", "exclude_trashed": "yes"})
+        return
+
+    created = bear_open_xurl("create", common)
+    if created:
+        notebook_meta["bearCreated"] = True
 
 
 def sanitize_name(name):
@@ -266,7 +351,9 @@ def iterate_notebooks(obj, parentObj):
                 'name': x['title'],
                 'path': newPath,
                 'updateTime': 0,
-                'items': {}
+                'items': {},
+                'bearCreated': False,
+                'bearTitle': "Scribe {}".format(id),
             }
         
         if x['type'] == "folder":
@@ -291,6 +378,7 @@ def iterate_notebooks(obj, parentObj):
                 pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(parentItems[id]['path']))
                 
                 convert_to_pdf(images, pdf_path)
+                sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
 
                 for x in images:
                     os.remove(x)
@@ -481,6 +569,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Sync Kindle Scribe notebooks to local PDF files.")
     parser.add_argument("--once", action="store_true", help="Run a single sync check then exit.")
     parser.add_argument("--no-tray", action="store_true", help="Disable system tray integration.")
+    parser.add_argument("--bear-sync", action="store_true", help="Sync updated notebook exports to Bear notes using x-callback-url (macOS only).")
+    parser.add_argument("--bear-dry-run", action="store_true", help="Print Bear x-callback URLs without opening them.")
     parser.add_argument("--update-minutes", type=int, default=UPDATE_MINUTES, help="Minutes between sync checks when running continuously.")
     return parser.parse_args()
 
@@ -514,10 +604,14 @@ def main():
     global UPDATE_MINUTES
     global use_tray
     global args
+    global bear_sync_enabled
+    global bear_dry_run
 
     args = parse_args()
     UPDATE_MINUTES = max(args.update_minutes, 1)
     use_tray = not args.no_tray
+    bear_sync_enabled = args.bear_sync
+    bear_dry_run = args.bear_dry_run
 
     if not os.path.exists(EXTRACT_PATH):
         os.mkdir(EXTRACT_PATH)
