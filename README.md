@@ -84,14 +84,14 @@ python KindleScribeSync.py --once --no-tray --bear-sync --bear-dry-run
 - Bear sync is optional and enabled only with `--bear-sync`.
 - A root tag `#scribe` is applied to all synced notes.
 - A subtag is generated from notebook path, for example `#scribe/work`.
-- Each Kindle notebook gets a stable Bear note title based on notebook ID, so future syncs can refresh the same note.
-- On first sync for a notebook, the note is created in Bear.
-- On subsequent syncs, note body is replaced using Bear `add-text` with `mode=replace_all`, which keeps the note current.
+- Bear note titles use a human-readable notebook path, for example `Work / Daily Work Notes`.
+- When notebook names collide in different folders, the path-based title keeps them distinct.
+- On first sync for a notebook, the note is created in Bear with the exported PDF attached.
+- On subsequent syncs, the previous Bear note is replaced with a fresh note containing the latest attached PDF.
 
 Each Bear note includes:
-- Notebook title
-- Notebook ID
+- Notebook path
 - Source path
 - Last sync timestamp
-- File link to the exported PDF
+- Attached PDF export
 

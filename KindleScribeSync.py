@@ -22,6 +22,7 @@
 # SOFTWARE.
 
 import argparse
+import base64
 import io
 import json
 import logging
@@ -60,6 +61,7 @@ RENDER_WIDTH = 1200
 NOTEBOOK_JSON_PATH = "notebooks.json"
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
+BEAR_SYNC_VERSION = 2
 
 ## Where to extract tar images
 EXTRACT_PATH = "extraction"
@@ -121,6 +123,48 @@ def build_bear_tags(notebook_path):
     return ["scribe", "scribe/{}".format("/".join(parts))]
 
 
+def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
+    """
+    Backfill state fields for notebook entries created before Bear sync support existed.
+    """
+    if "bearCreated" not in notebook_meta:
+        notebook_meta["bearCreated"] = False
+    if "bearTitle" not in notebook_meta:
+        notebook_meta["bearTitle"] = None
+    if "bearSyncVersion" not in notebook_meta:
+        notebook_meta["bearSyncVersion"] = 0
+
+
+def build_bear_note_title(notebook_path):
+    """
+    Build a human-readable, path-based note title to avoid collisions.
+    """
+    parts = [part for part in notebook_path.split(os.sep) if part]
+    return " / ".join(parts) if parts else "Untitled Notebook"
+
+
+def build_bear_marker(notebook_id):
+    """
+    Hidden unique marker used to find and replace existing Bear notes safely.
+    """
+    return "kindle-scribe-sync-id:{}".format(notebook_id)
+
+
+def encode_file_for_bear(file_path):
+    """
+    Base64 encode a file for Bear x-callback file attachment parameters.
+    """
+    file_bytes = Path(file_path).read_bytes()
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    logger.info(
+        "Prepared Bear attachment: path=%s size_bytes=%s encoded_chars=%s",
+        file_path,
+        len(file_bytes),
+        len(encoded),
+    )
+    return encoded
+
+
 def bear_open_xurl(action, params):
     """
     Execute a Bear x-callback-url action via macOS `open`.
@@ -132,53 +176,86 @@ def bear_open_xurl(action, params):
     query = urlencode(params, quote_via=quote, safe=",")
     url = "bear://x-callback-url/{}?{}".format(action, query)
     logger.info("Bear sync action: %s", action)
+    logger.info("Bear sync params: title=%s tags=%s", params.get("title"), params.get("tags"))
+    logger.info("Bear URL length: %s", len(url))
     if bear_dry_run:
         logger.info("Bear dry-run URL: %s", url)
         return True
 
     try:
-        subprocess.run(["open", url], check=True)
+        logger.info("Opening Bear x-callback URL via osascript")
+        applescript = 'open location "{}"\n'.format(url.replace('"', '\\"'))
+        subprocess.run(["osascript"], input=applescript, text=True, check=True)
+        logger.info("Bear x-callback URL accepted by osascript")
         return True
     except Exception as ex:
         logger.error("Bear x-callback open failed: %s", ex)
         return False
 
 
+def bear_trash_note(search_term, reason):
+    """
+    Trash a Bear note using a unique search term.
+    """
+    logger.info("Attempting Bear trash for reason='%s' search='%s'", reason, search_term)
+    return bear_open_xurl("trash", {"search": search_term, "show_window": "no"})
+
+
 def sync_pdf_to_bear(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
     """
-    Upsert notebook information to Bear.
-    Strategy: try replace_all by title; if it does not exist, create it.
+    Recreate the notebook note in Bear with the latest attached PDF.
     """
     if not bear_sync_enabled:
+        logger.debug("Bear sync disabled; skipping notebook '%s'", notebook_name)
         return
 
+    ensure_notebook_tracking_defaults(notebook_id, notebook_meta)
     tags = build_bear_tags(notebook_path)
-    bear_title = notebook_meta.get("bearTitle") or "Scribe {}".format(notebook_id)
+    marker = build_bear_marker(notebook_id)
+    previous_bear_title = notebook_meta.get("bearTitle")
+    bear_title = build_bear_note_title(notebook_path)
     notebook_meta["bearTitle"] = bear_title
     note_text = (
-        "# {}\\n\\n"
-        "Source Notebook ID: {}\\n"
-        "Source Notebook Path: {}\\n"
-        "Last Synced: {}\\n\\n"
-        "PDF Export: [Open PDF](file://{})\\n"
-    ).format(notebook_name, notebook_id, notebook_path, datetime.now().isoformat(timespec="seconds"), Path(pdf_path).resolve())
+        "Notebook Path: {}\n"
+        "Last Synced: {}\n\n"
+        "Attached: latest Kindle Scribe PDF export.\n\n"
+        "<!-- {} -->\n"
+    ).format(notebook_path, datetime.now().isoformat(timespec="seconds"), marker)
+    filename = Path(pdf_path).name
+    encoded_file = encode_file_for_bear(pdf_path)
 
-    common = {
+    create_params = {
         "title": bear_title,
         "text": note_text,
+        "file": encoded_file,
+        "filename": filename,
         "tags": ",".join(tags),
         "open_note": "no",
         "show_window": "no",
     }
 
-    if notebook_meta.get("bearCreated", False):
-        # replace_all keeps the note title untouched and updates the body incrementally on each sync.
-        bear_open_xurl("add-text", {**common, "mode": "replace_all", "exclude_trashed": "yes"})
-        return
+    logger.info(
+        "Preparing Bear sync for notebook '%s' (id=%s, pdf_exists=%s, bear_created=%s)",
+        notebook_name,
+        notebook_id,
+        os.path.exists(pdf_path),
+        notebook_meta.get("bearCreated", False),
+    )
 
-    created = bear_open_xurl("create", common)
+    # Migrate notes created with the previous UUID title scheme.
+    if previous_bear_title and previous_bear_title != bear_title:
+        bear_trash_note(previous_bear_title, "migrate_title")
+
+    if notebook_meta.get("bearCreated", False):
+        bear_trash_note(marker, "refresh_existing_note")
+
+    created = bear_open_xurl("create", create_params)
     if created:
         notebook_meta["bearCreated"] = True
+        notebook_meta["bearSyncVersion"] = BEAR_SYNC_VERSION
+        logger.info("Bear note recreated with attachment for '%s'", notebook_name)
+    else:
+        logger.warning("Bear note create/recreate failed for '%s'", notebook_name)
 
 
 def sanitize_name(name):
@@ -355,6 +432,8 @@ def iterate_notebooks(obj, parentObj):
                 'bearCreated': False,
                 'bearTitle': "Scribe {}".format(id),
             }
+        else:
+            ensure_notebook_tracking_defaults(id, parentItems[id])
         
         if x['type'] == "folder":
             folder_path = os.path.join(SYNC_PATH, parentItems[id]['path'])
@@ -366,7 +445,33 @@ def iterate_notebooks(obj, parentObj):
         if x['type'] == "notebook":
             nb_data = get_notebook(id)
             time.sleep(1)
-            if nb_data['metadata']['modificationTime'] > parentItems[id]['updateTime']:
+            modification_time = nb_data['metadata']['modificationTime']
+            current_update_time = parentItems[id]['updateTime']
+            pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(parentItems[id]['path']))
+            desired_bear_title = build_bear_note_title(parentItems[id]['path'])
+            should_render_pdf = modification_time > current_update_time
+            should_seed_bear = (
+                bear_sync_enabled
+                and os.path.exists(pdf_path)
+                and (
+                    not parentItems[id].get('bearCreated', False)
+                    or parentItems[id].get('bearTitle') != desired_bear_title
+                    or parentItems[id].get('bearSyncVersion', 0) < BEAR_SYNC_VERSION
+                )
+            )
+
+            logger.info(
+                "Notebook '%s': remote_modification=%s local_update=%s should_render_pdf=%s should_seed_bear=%s bear_title=%s bear_version=%s",
+                parentItems[id]['name'],
+                modification_time,
+                current_update_time,
+                should_render_pdf,
+                should_seed_bear,
+                parentItems[id].get('bearTitle'),
+                parentItems[id].get('bearSyncVersion', 0),
+            )
+
+            if should_render_pdf:
                 total_pages = nb_data['metadata']['totalPages']
 
                 if (total_pages > 0):
@@ -374,9 +479,7 @@ def iterate_notebooks(obj, parentObj):
 
                 tardata = render_notebook(nb_data['renderingToken'], total_pages)
                 images = extract_tarfile(tardata)
-                
-                pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(parentItems[id]['path']))
-                
+
                 convert_to_pdf(images, pdf_path)
                 sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
 
@@ -386,6 +489,11 @@ def iterate_notebooks(obj, parentObj):
                 global update_count
                 update_count += 1
                 parentItems[id]['updateTime'] = int(time.time())
+            elif should_seed_bear:
+                logger.info("Skipping PDF render for '%s'; reusing existing PDF for initial Bear sync", parentItems[id]['name'])
+                sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+            elif bear_sync_enabled:
+                logger.info("Skipping Bear sync for '%s'; no PDF changes and Bear note already tracked", parentItems[id]['name'])
 
 def id_exists_in_object(id, sync_items = []):
     """
