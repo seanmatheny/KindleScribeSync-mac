@@ -107,7 +107,8 @@ bear_sync_enabled = False
 bear_dry_run = False
 bear_force_resync = False
 notebook_name_counts = {}
-bear_pending_deletes = {}
+bear_pending_deletes = {}  # Notebooks queued for deletion with retry tracking
+bear_manual_cleanup_required = {}  # Notebooks that exceeded retry limit; need manual deletion
 config = {
     "update_minutes": UPDATE_MINUTES,
     "bear_sync": False,
@@ -454,92 +455,94 @@ def bear_open_xurl(action, params):
         return False
 
 
+def test_bear_applescript_capability():
+    """
+    Test whether AppleScript can interact with Bear at all.
+    """
+    try:
+        # Simple test: see if we can tell Bear to reveal itself
+        applescript = (
+            'tell application "Bear"\n'
+            '  return true\n'
+            'end tell\n'
+        )
+        result = subprocess.run(
+            ["osascript", "-e", applescript],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        works = result.returncode == 0 and "true" in result.stdout.lower()
+        if works:
+            logger.info("AppleScript Bear connectivity test: PASSED")
+        else:
+            logger.warning(
+                "AppleScript Bear connectivity test: FAILED (code=%s, stdout=%s, stderr=%s)",
+                result.returncode,
+                result.stdout.strip(),
+                result.stderr.strip(),
+            )
+        return works
+    except Exception as ex:
+        logger.warning("AppleScript Bear connectivity test failed with exception: %s", ex)
+        return False
+
+
 def bear_delete_note_by_title(title, reason):
     """
-    Delete a Bear note by exact title using AppleScript.
-    Returns True if the delete command succeeded, False otherwise.
+    Delete a Bear note by exact title.
+    Note: Bear's API does not support programmatic deletion, so this opens Bear's search UI.
+    User must manually delete the note from the search results.
     """
     if not title:
         logger.warning("Cannot delete Bear note: no title provided")
         return False
 
     if bear_dry_run:
-        logger.info("Bear dry-run: would delete note with title '%s'", title)
+        logger.info("Bear dry-run: would open Bear search for title='%s'", title)
         return True
 
-    try:
-        # Escape single quotes in the title for AppleScript
-        escaped_title = title.replace("'", "'\"'\"'")
-        applescript = (
-            "tell application \"Bear\"\n"
-            "  try\n"
-            "    move (first note where title is equal to '{}') to trash\n"
-            "    return true\n"
-            "  on error\n"
-            "    return false\n"
-            "  end try\n"
-            "end tell\n"
-        ).format(escaped_title)
-        result = subprocess.run(
-            ["osascript", "-e", applescript],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        success = result.returncode == 0 and "true" in result.stdout.lower()
-        if success:
-            logger.info("Successfully deleted Bear note '%s' via AppleScript for reason='%s'", title, reason)
-        else:
-            logger.warning("AppleScript delete for '%s' failed or returned no match (reason='%s')", title, reason)
-        return success
-    except Exception as ex:
-        logger.error("AppleScript delete failed for '%s': %s", title, ex)
-        return False
+    logger.info(
+        "Opening Bear search for note title='%s'; you must manually delete from search results (reason='%s')",
+        title,
+        reason,
+    )
+    # Open Bear search UI so user can manually delete
+    bear_open_xurl("search", {"term": title})
+    return False
 
 
 def bear_delete_note_by_marker(marker, reason):
     """
-    Delete a Bear note by marker search using AppleScript.
-    Returns True if the delete command succeeded, False otherwise.
+    Delete a Bear note by marker search.
+    Note: Bear's API does not support programmatic deletion, so this opens Bear's search UI.
+    User must manually delete the note from the search results.
     """
     if not marker:
         logger.warning("Cannot delete Bear note: no marker provided")
         return False
 
     if bear_dry_run:
-        logger.info("Bear dry-run: would search for and delete note with marker '%s'", marker)
+        logger.info("Bear dry-run: would open Bear search for marker='%s'", marker)
         return True
 
-    try:
-        # Search for notes containing the marker, then delete them
-        applescript = (
-            "tell application \"Bear\"\n"
-            "  try\n"
-            "    set notesToDelete to notes where body contains \"{}\"\n"
-            "    repeat with noteToDelete in notesToDelete\n"
-            "      move noteToDelete to trash\n"
-            "    end repeat\n"
-            "    return true\n"
-            "  on error\n"
-            "    return false\n"
-            "  end try\n"
-            "end tell\n"
-        ).format(marker)
-        result = subprocess.run(
-            ["osascript", "-e", applescript],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        success = result.returncode == 0 and "true" in result.stdout.lower()
-        if success:
-            logger.info("Successfully deleted Bear notes with marker '%s' via AppleScript for reason='%s'", marker, reason)
-        else:
-            logger.warning("AppleScript delete by marker '%s' failed or returned no match (reason='%s')", marker, reason)
-        return success
-    except Exception as ex:
-        logger.error("AppleScript delete by marker failed for '%s': %s", marker, ex)
-        return False
+    # For markers like "Notebook Path: ...", extract a user-friendly search term
+    if marker.startswith("Notebook Path:"):
+        search_term = marker.replace("Notebook Path: ", "").strip()
+    elif marker.startswith("kindle-scribe-sync-id:"):
+        search_term = marker
+    else:
+        search_term = marker
+
+    logger.info(
+        "Opening Bear search for marker='%s' (search_term='%s'); you must manually delete from search results (reason='%s')",
+        marker,
+        search_term,
+        reason,
+    )
+    # Open Bear search UI so user can manually delete
+    bear_open_xurl("search", {"term": search_term})
+    return False
 
 
 def bear_trash_note(*, reason, title=None, search_term=None):
@@ -832,11 +835,42 @@ def recover_pending_bear_deletes_from_log(max_lines=5000):
         logger.info("Recovered %s pending Bear deletions from prior logs", recovered)
 
 
+def report_bear_manual_cleanup_required():
+    """
+    Report notebooks that exceeded retry limits and require manual deletion from Bear.
+    """
+    global bear_manual_cleanup_required
+    if not bear_sync_enabled or not bear_manual_cleanup_required:
+        return
+
+    logger.warning("="*80)
+    logger.warning("BEAR MANUAL CLEANUP REQUIRED")
+    logger.warning("The following notebooks could not be automatically deleted from Bear")
+    logger.warning("You must manually delete them. Use Bear's search to find and delete:")
+    logger.warning("="*80)
+    for notebook_id, meta in bear_manual_cleanup_required.items():
+        notebook_name = meta.get("name", "(unknown)")
+        notebook_path = meta.get("path", "(unknown)")
+        bear_title = meta.get("bearTitle", "(unknown)")
+        attempts = meta.get("attempts", "?")
+        logger.warning(
+            "  • Notebook: %s (path: %s)\n"
+            "    Bear title to search for: %s\n"
+            "    Attempts made: %s",
+            notebook_name,
+            notebook_path,
+            bear_title,
+            attempts,
+        )
+    logger.warning("="*80)
+
+
 def process_pending_bear_deletes():
     """
     Retry Bear cleanup for notebooks deleted in earlier runs.
+    After max retries, move to manual_cleanup_required list with clear user guidance.
     """
-    global bear_pending_deletes
+    global bear_pending_deletes, bear_manual_cleanup_required
     if not bear_sync_enabled or not bear_pending_deletes:
         return
 
@@ -847,7 +881,19 @@ def process_pending_bear_deletes():
         pending_meta["remainingRuns"] = int(pending_meta.get("remainingRuns", BEAR_DELETE_RETRY_RUNS)) - 1
         trash_bear_for_notebook(notebook_id, pending_meta, "retry_pending_delete", aggressive=True)
         if pending_meta["remainingRuns"] <= 0:
-            logger.info("Expiring pending Bear cleanup retries for notebook id=%s", notebook_id)
+            notebook_name = pending_meta.get("name", "(unknown)")
+            notebook_path = pending_meta.get("path", "(unknown)")
+            bear_title = pending_meta.get("bearTitle", "(unknown)")
+            logger.warning(
+                "Bear deletion retry limit exceeded for notebook '%s' (id=%s, path=%s). "
+                "You must manually delete from Bear. Search for: title='%s' or path='%s'",
+                notebook_name,
+                notebook_id,
+                notebook_path,
+                bear_title,
+                notebook_path,
+            )
+            bear_manual_cleanup_required[notebook_id] = pending_meta
             del bear_pending_deletes[notebook_id]
 
 def close_app():
@@ -1243,6 +1289,9 @@ def check_notebooks():
                 driver = None
 
     get_all_notebooks()
+
+    # Report any notebooks that need manual Bear cleanup
+    report_bear_manual_cleanup_required()
 
     now = datetime.now()
     last_update = now.strftime("%m/%d/%Y, %H:%M:%S")
