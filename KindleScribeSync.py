@@ -30,6 +30,7 @@ import os
 import pickle
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import signal
@@ -106,6 +107,9 @@ args = None
 bear_sync_enabled = False
 bear_dry_run = False
 bear_force_resync = False
+obsidian_sync_enabled = False
+obsidian_vault_path = None
+obsidian_force_resync = False
 notebook_name_counts = {}
 bear_pending_deletes = {}  # Notebooks queued for deletion with retry tracking
 bear_manual_cleanup_required = {}  # Notebooks that exceeded retry limit; need manual deletion
@@ -114,6 +118,9 @@ config = {
     "bear_sync": False,
     "bear_dry_run": False,
     "bear_force_resync": False,
+    "obsidian_sync": False,
+    "obsidian_vault_path": None,
+    "obsidian_force_resync": False,
 }
 
 
@@ -332,6 +339,28 @@ def handle_reset_bear_state(icon=None, item=None):
     notify("Reset local Bear sync state. The next Bear sync will recreate notes.")
 
 
+def reset_obsidian_sync_state(items):
+    """
+    Clear persisted Obsidian sync markers so markdown files can be recreated from scratch.
+    """
+    if isinstance(items, dict):
+        iterable = items.values()
+    else:
+        iterable = items
+
+    for entry in iterable:
+        if isinstance(entry, dict):
+            entry["obsidianSynced"] = False
+            if "items" in entry:
+                reset_obsidian_sync_state(entry["items"])
+
+
+def handle_reset_obsidian_state(icon=None, item=None):
+    reset_obsidian_sync_state(notebooks)
+    save_notebook_json()
+    notify("Reset local Obsidian sync state. The next Obsidian sync will recreate markdown files.")
+
+
 def configure_schedule():
     schedule.clear("sync")
     schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks).tag("sync")
@@ -386,6 +415,8 @@ def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
         notebook_meta["bearTitle"] = None
     if "bearSyncVersion" not in notebook_meta:
         notebook_meta["bearSyncVersion"] = 0
+    if "obsidianSynced" not in notebook_meta:
+        notebook_meta["obsidianSynced"] = False
 
 
 def build_bear_note_title(notebook_name, notebook_path):
@@ -692,6 +723,69 @@ def sanitize_name(name):
     """
     cleaned = re.sub(r"[\\/:*?\"<>|]", "_", name).strip()
     return cleaned or "untitled"
+
+
+def sync_pdf_to_obsidian(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
+    """
+    Create or replace an Obsidian markdown file for the notebook with a PDF embed.
+    The PDF is copied into the vault's attachments folder so Obsidian can embed it.
+    Tags mirror those used for Bear sync.
+    """
+    if not obsidian_sync_enabled:
+        logger.debug("Obsidian sync disabled; skipping notebook '%s'", notebook_name)
+        return
+
+    if not obsidian_vault_path:
+        logger.warning("Obsidian sync enabled but no vault path configured; skipping notebook '%s'", notebook_name)
+        return
+
+    ensure_notebook_tracking_defaults(notebook_id, notebook_meta)
+    tags = build_bear_tags(notebook_path)
+
+    vault = Path(obsidian_vault_path)
+
+    # Copy the PDF into the vault under attachments/Kindle Scribe/, mirroring the
+    # notebook folder structure (e.g. "Work/Projects/Meeting Notes.pdf").
+    pdf_rel = "{}.pdf".format(notebook_path)
+    vault_pdf_dest = vault / "attachments" / "Kindle Scribe" / pdf_rel
+    vault_pdf_dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(pdf_path, vault_pdf_dest)
+        logger.info("Copied PDF to Obsidian vault: %s", vault_pdf_dest)
+    except Exception as ex:
+        logger.error("Failed to copy PDF to Obsidian vault for '%s': %s", notebook_name, ex)
+        return
+
+    # Build the Obsidian embed path relative to the vault root.
+    pdf_embed_path = "attachments/Kindle Scribe/{}".format(pdf_rel)
+
+    # Build YAML frontmatter tags list.
+    yaml_tags = "\n".join("  - {}".format(t) for t in tags)
+    frontmatter = "---\ntags:\n{}\n---\n".format(yaml_tags)
+
+    body = (
+        "# {}\n\n"
+        "**Notebook Path:** {}\n"
+        "**Last Synced:** {}\n\n"
+        "![[{}]]\n"
+    ).format(
+        notebook_name,
+        notebook_path,
+        datetime.now().isoformat(timespec="seconds"),
+        pdf_embed_path,
+    )
+
+    note_content = frontmatter + body
+
+    # Write the markdown file, mirroring the notebook folder structure inside the vault.
+    md_path = vault / "{}.md".format(notebook_path)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        md_path.write_text(note_content, encoding="utf-8")
+        notebook_meta["obsidianSynced"] = True
+        logger.info("Obsidian markdown written for '%s': %s", notebook_name, md_path)
+    except Exception as ex:
+        logger.error("Failed to write Obsidian markdown for '%s': %s", notebook_name, ex)
 
 
 def build_driver():
@@ -1072,9 +1166,17 @@ def iterate_notebooks(obj, parentObj):
                     or parentItems[id].get('bearSyncVersion', 0) < BEAR_SYNC_VERSION
                 )
             )
+            should_seed_obsidian = (
+                obsidian_sync_enabled
+                and os.path.exists(pdf_path)
+                and (
+                    obsidian_force_resync
+                    or not parentItems[id].get('obsidianSynced', False)
+                )
+            )
 
             logger.info(
-                "Notebook '%s': remote_modification=%s local_update=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s",
+                "Notebook '%s': remote_modification=%s local_update=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s",
                 parentItems[id]['name'],
                 modification_time,
                 current_update_time,
@@ -1084,6 +1186,7 @@ def iterate_notebooks(obj, parentObj):
                 bear_force_resync,
                 parentItems[id].get('bearTitle'),
                 parentItems[id].get('bearSyncVersion', 0),
+                should_seed_obsidian,
             )
 
             if should_render_pdf:
@@ -1097,6 +1200,7 @@ def iterate_notebooks(obj, parentObj):
 
                 convert_to_pdf(images, pdf_path)
                 sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
 
                 for x in images:
                     os.remove(x)
@@ -1104,11 +1208,18 @@ def iterate_notebooks(obj, parentObj):
                 global update_count
                 update_count += 1
                 parentItems[id]['updateTime'] = int(time.time())
-            elif should_seed_bear and os.path.exists(pdf_path):
-                logger.info("Skipping PDF render for '%s'; reusing existing PDF for Bear sync", parentItems[id]['name'])
-                sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
-            elif bear_sync_enabled:
-                logger.info("Skipping Bear sync for '%s'; no PDF changes and Bear note already tracked", parentItems[id]['name'])
+            else:
+                if should_seed_bear and os.path.exists(pdf_path):
+                    logger.info("Skipping PDF render for '%s'; reusing existing PDF for Bear sync", parentItems[id]['name'])
+                    sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                elif bear_sync_enabled:
+                    logger.info("Skipping Bear sync for '%s'; no PDF changes and Bear note already tracked", parentItems[id]['name'])
+
+                if should_seed_obsidian and os.path.exists(pdf_path):
+                    logger.info("Skipping PDF render for '%s'; reusing existing PDF for Obsidian sync", parentItems[id]['name'])
+                    sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                elif obsidian_sync_enabled:
+                    logger.info("Skipping Obsidian sync for '%s'; no PDF changes and Obsidian note already tracked", parentItems[id]['name'])
 
 def id_exists_in_object(id, sync_items = []):
     """
@@ -1306,6 +1417,10 @@ def parse_args():
     parser.add_argument("--bear-dry-run", action="store_true", help="Print Bear x-callback URLs without opening them.")
     parser.add_argument("--bear-force-resync", action="store_true", help="Recreate Bear notes even when local sync state says they are already current.")
     parser.add_argument("--reset-bear-state", action="store_true", help="Clear local Bear sync markers before syncing.")
+    parser.add_argument("--obsidian-sync", action="store_true", help="Sync updated notebook exports to an Obsidian vault as markdown files with embedded PDFs.")
+    parser.add_argument("--obsidian-vault", type=str, default=None, help="Path to the Obsidian vault directory. Overrides config.json.")
+    parser.add_argument("--obsidian-force-resync", action="store_true", help="Recreate Obsidian markdown files even when local sync state says they are already current.")
+    parser.add_argument("--reset-obsidian-state", action="store_true", help="Clear local Obsidian sync markers before syncing.")
     parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
     parser.add_argument("--launchd-remove", action="store_true", help="Remove the macOS launch agent.")
     parser.add_argument("--launchd-status", action="store_true", help="Print whether the macOS launch agent is installed.")
@@ -1325,6 +1440,9 @@ def main():
     global bear_sync_enabled
     global bear_dry_run
     global bear_force_resync
+    global obsidian_sync_enabled
+    global obsidian_vault_path
+    global obsidian_force_resync
 
     args = parse_args()
     load_config()
@@ -1335,6 +1453,9 @@ def main():
     bear_sync_enabled = args.bear_sync or config.get("bear_sync", False)
     bear_dry_run = args.bear_dry_run or config.get("bear_dry_run", False)
     bear_force_resync = args.bear_force_resync or config.get("bear_force_resync", False)
+    obsidian_sync_enabled = args.obsidian_sync or config.get("obsidian_sync", False)
+    obsidian_vault_path = args.obsidian_vault or config.get("obsidian_vault_path") or None
+    obsidian_force_resync = args.obsidian_force_resync or config.get("obsidian_force_resync", False)
 
     if args.launchd_install:
         install_launch_agent()
@@ -1366,6 +1487,9 @@ def main():
 
     if args.reset_bear_state:
         handle_reset_bear_state()
+
+    if args.reset_obsidian_state:
+        handle_reset_obsidian_state()
 
     run_sync_loop()
     close_app()
