@@ -2,5 +2,8 @@
   "update_minutes": 30,
   "bear_sync": false,
   "bear_dry_run": false,
-  "bear_force_resync": false
+  "bear_force_resync": false,
+  "obsidian_sync": false,
+  "obsidian_vault_path": "/path/to/your/obsidian/vault",
+  "obsidian_force_resync": false
 }
