@@ -145,6 +145,8 @@ python KindleScribeSync.py --once --pdf-folder-sync --reset-pdf-folder-state
 
 ## launchd (Run at Login)
 
+Note: The script will detect the currently sourced virtual environment, and use that for the launchd agent. So best to try out a `--once` run first 
+
 Install as a macOS launch agent (starts at login, restarts on crash)
 ```
 python KindleScribeSync.py --launchd-install
