@@ -8,3 +8,4 @@ venv/
 kindle_notebooks/
 extraction/
 bear_pending_deletes.json
+debug.log
