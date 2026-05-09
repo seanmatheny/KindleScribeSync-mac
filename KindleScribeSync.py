@@ -110,6 +110,9 @@ bear_force_resync = False
 obsidian_sync_enabled = False
 obsidian_vault_path = None
 obsidian_force_resync = False
+pdf_folder_sync_enabled = False
+pdf_folder_path = None
+pdf_folder_force_resync = False
 notebook_name_counts = {}
 bear_pending_deletes = {}  # Notebooks queued for deletion with retry tracking
 bear_manual_cleanup_required = {}  # Notebooks that exceeded retry limit; need manual deletion
@@ -121,6 +124,9 @@ config = {
     "obsidian_sync": False,
     "obsidian_vault_path": None,
     "obsidian_force_resync": False,
+    "pdf_folder_sync": False,
+    "pdf_folder_path": None,
+    "pdf_folder_force_resync": False,
 }
 
 
@@ -361,6 +367,28 @@ def handle_reset_obsidian_state(icon=None, item=None):
     notify("Reset local Obsidian sync state. The next Obsidian sync will recreate markdown files.")
 
 
+def reset_pdf_folder_sync_state(items):
+    """
+    Clear persisted PDF folder sync markers so PDFs are re-copied on the next sync.
+    """
+    if isinstance(items, dict):
+        iterable = items.values()
+    else:
+        iterable = items
+
+    for entry in iterable:
+        if isinstance(entry, dict):
+            entry["pdfFolderSynced"] = False
+            if "items" in entry:
+                reset_pdf_folder_sync_state(entry["items"])
+
+
+def handle_reset_pdf_folder_state(icon=None, item=None):
+    reset_pdf_folder_sync_state(notebooks)
+    save_notebook_json()
+    notify("Reset local PDF folder sync state. The next sync will re-copy all PDFs to the export folder.")
+
+
 def configure_schedule():
     schedule.clear("sync")
     schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks).tag("sync")
@@ -417,6 +445,8 @@ def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
         notebook_meta["bearSyncVersion"] = 0
     if "obsidianSynced" not in notebook_meta:
         notebook_meta["obsidianSynced"] = False
+    if "pdfFolderSynced" not in notebook_meta:
+        notebook_meta["pdfFolderSynced"] = False
 
 
 def build_bear_note_title(notebook_name, notebook_path):
@@ -786,6 +816,32 @@ def sync_pdf_to_obsidian(notebook_id, notebook_path, notebook_name, pdf_path, no
         logger.info("Obsidian markdown written for '%s': %s", notebook_name, md_path)
     except Exception as ex:
         logger.error("Failed to write Obsidian markdown for '%s': %s", notebook_name, ex)
+
+
+def sync_pdf_to_folder(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
+    """
+    Copy the notebook PDF into the configured export folder, mirroring the remote
+    folder hierarchy. Replaces any existing file so it always reflects the current
+    state of the note pages on the Kindle.
+    """
+    if not pdf_folder_sync_enabled:
+        logger.debug("PDF folder sync disabled; skipping notebook '%s'", notebook_name)
+        return
+
+    if not pdf_folder_path:
+        logger.warning("PDF folder sync enabled but no folder path configured; skipping notebook '%s'", notebook_name)
+        return
+
+    ensure_notebook_tracking_defaults(notebook_id, notebook_meta)
+
+    dest_path = Path(pdf_folder_path) / "{}.pdf".format(notebook_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(pdf_path, dest_path)
+        notebook_meta["pdfFolderSynced"] = True
+        logger.info("Copied PDF to export folder: %s", dest_path)
+    except Exception as ex:
+        logger.error("Failed to copy PDF to export folder for '%s': %s", notebook_name, ex)
 
 
 def build_driver():
@@ -1174,9 +1230,17 @@ def iterate_notebooks(obj, parentObj):
                     or not parentItems[id].get('obsidianSynced', False)
                 )
             )
+            should_seed_pdf_folder = (
+                pdf_folder_sync_enabled
+                and os.path.exists(pdf_path)
+                and (
+                    pdf_folder_force_resync
+                    or not parentItems[id].get('pdfFolderSynced', False)
+                )
+            )
 
             logger.info(
-                "Notebook '%s': remote_modification=%s local_update=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s",
+                "Notebook '%s': remote_modification=%s local_update=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s should_seed_pdf_folder=%s",
                 parentItems[id]['name'],
                 modification_time,
                 current_update_time,
@@ -1187,6 +1251,7 @@ def iterate_notebooks(obj, parentObj):
                 parentItems[id].get('bearTitle'),
                 parentItems[id].get('bearSyncVersion', 0),
                 should_seed_obsidian,
+                should_seed_pdf_folder,
             )
 
             if should_render_pdf:
@@ -1201,6 +1266,7 @@ def iterate_notebooks(obj, parentObj):
                 convert_to_pdf(images, pdf_path)
                 sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
                 sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                sync_pdf_to_folder(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
 
                 for x in images:
                     os.remove(x)
@@ -1220,6 +1286,12 @@ def iterate_notebooks(obj, parentObj):
                     sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
                 elif obsidian_sync_enabled:
                     logger.info("Skipping Obsidian sync for '%s'; no PDF changes and Obsidian note already tracked", parentItems[id]['name'])
+
+                if should_seed_pdf_folder and os.path.exists(pdf_path):
+                    logger.info("Skipping PDF render for '%s'; reusing existing PDF for folder sync", parentItems[id]['name'])
+                    sync_pdf_to_folder(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                elif pdf_folder_sync_enabled:
+                    logger.info("Skipping PDF folder sync for '%s'; no PDF changes and PDF already copied to folder", parentItems[id]['name'])
 
 def id_exists_in_object(id, sync_items = []):
     """
@@ -1255,6 +1327,14 @@ def prune_orphans(items, sync_items):
                 queue_bear_delete(k, dict_object)
                 trash_bear_for_notebook(k, dict_object, "prune_orphan", aggressive=True)
                 pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(dict_object['path']))
+                if pdf_folder_sync_enabled and pdf_folder_path:
+                    folder_pdf_path = os.path.join(pdf_folder_path, "{}.pdf".format(dict_object['path']))
+                    try:
+                        if os.path.exists(folder_pdf_path):
+                            os.remove(folder_pdf_path)
+                            logger.info("Removed orphaned PDF from export folder: %s", folder_pdf_path)
+                    except Exception as ex:
+                        logger.error("Failed to remove orphaned PDF from export folder: %s: %s", folder_pdf_path, ex)
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
                     os.remove(pdf_path)
@@ -1421,6 +1501,10 @@ def parse_args():
     parser.add_argument("--obsidian-vault", type=str, default=None, help="Path to the Obsidian vault directory. Overrides config.json.")
     parser.add_argument("--obsidian-force-resync", action="store_true", help="Recreate Obsidian markdown files even when local sync state says they are already current.")
     parser.add_argument("--reset-obsidian-state", action="store_true", help="Clear local Obsidian sync markers before syncing.")
+    parser.add_argument("--pdf-folder-sync", action="store_true", help="Copy updated notebook PDFs into a local folder, mirroring the remote folder hierarchy.")
+    parser.add_argument("--pdf-folder-path", type=str, default=None, help="Path to the destination folder for PDF exports. Overrides config.json.")
+    parser.add_argument("--pdf-folder-force-resync", action="store_true", help="Re-copy PDFs to the export folder even when local sync state says they are already current.")
+    parser.add_argument("--reset-pdf-folder-state", action="store_true", help="Clear local PDF folder sync markers before syncing.")
     parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
     parser.add_argument("--launchd-remove", action="store_true", help="Remove the macOS launch agent.")
     parser.add_argument("--launchd-status", action="store_true", help="Print whether the macOS launch agent is installed.")
@@ -1443,6 +1527,9 @@ def main():
     global obsidian_sync_enabled
     global obsidian_vault_path
     global obsidian_force_resync
+    global pdf_folder_sync_enabled
+    global pdf_folder_path
+    global pdf_folder_force_resync
 
     args = parse_args()
     load_config()
@@ -1456,6 +1543,9 @@ def main():
     obsidian_sync_enabled = args.obsidian_sync or config.get("obsidian_sync", False)
     obsidian_vault_path = args.obsidian_vault or config.get("obsidian_vault_path") or None
     obsidian_force_resync = args.obsidian_force_resync or config.get("obsidian_force_resync", False)
+    pdf_folder_sync_enabled = args.pdf_folder_sync or config.get("pdf_folder_sync", False)
+    pdf_folder_path = args.pdf_folder_path or config.get("pdf_folder_path") or None
+    pdf_folder_force_resync = args.pdf_folder_force_resync or config.get("pdf_folder_force_resync", False)
 
     if args.launchd_install:
         install_launch_agent()
@@ -1490,6 +1580,9 @@ def main():
 
     if args.reset_obsidian_state:
         handle_reset_obsidian_state()
+
+    if args.reset_pdf_folder_state:
+        handle_reset_pdf_folder_state()
 
     run_sync_loop()
     close_app()

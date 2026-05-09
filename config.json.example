@@ -5,5 +5,8 @@
   "bear_force_resync": false,
   "obsidian_sync": false,
   "obsidian_vault_path": "/path/to/your/obsidian/vault",
-  "obsidian_force_resync": false
+  "obsidian_force_resync": false,
+  "pdf_folder_sync": false,
+  "pdf_folder_path": "/path/to/your/pdf/export/folder",
+  "pdf_folder_force_resync": false
 }
