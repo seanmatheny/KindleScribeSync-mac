@@ -1114,9 +1114,11 @@ def render_notebook(renderingToken, notebook_len):
     global session
     logger.info("Rendering notebook")
     request_url = URL_RENDER_NOTEBOOK.replace("[NOTEBOOK_LENGTH]", str(notebook_len))
+    request_url = "{}&_t={}".format(request_url, int(time.time()))
     session.headers[AMZ_RENDER_HEADER] = renderingToken
+    no_cache_headers = {"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
     while True:
-        resp = session.get(request_url)
+        resp = session.get(request_url, headers=no_cache_headers)
         if resp.is_redirect:
             rm_cookies()
             authenticate()
@@ -1133,9 +1135,10 @@ def get_notebook(id):
     global cookies
     global session
     logger.info("Getting notebook '{}' data".format(id))
-    request_url = URL_OPEN_NOTEBOOK.replace("[NOTEBOOK_ID]", id)
+    request_url = "{}&_t={}".format(URL_OPEN_NOTEBOOK.replace("[NOTEBOOK_ID]", id), int(time.time()))
+    no_cache_headers = {"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
     while True:
-        resp = session.get(request_url)
+        resp = session.get(request_url, headers=no_cache_headers)
         if resp.is_redirect:
             rm_cookies()
             authenticate()
