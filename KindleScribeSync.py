@@ -36,7 +36,7 @@ import sys
 import signal
 import tarfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import rmtree
 from urllib.parse import quote, urlencode
@@ -113,6 +113,7 @@ obsidian_force_resync = False
 pdf_folder_sync_enabled = False
 pdf_folder_path = None
 pdf_folder_force_resync = False
+force_render = False
 notebook_name_counts = {}
 bear_pending_deletes = {}  # Notebooks queued for deletion with retry tracking
 bear_manual_cleanup_required = {}  # Notebooks that exceeded retry limit; need manual deletion
@@ -447,6 +448,8 @@ def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
         notebook_meta["obsidianSynced"] = False
     if "pdfFolderSynced" not in notebook_meta:
         notebook_meta["pdfFolderSynced"] = False
+    if "totalPages" not in notebook_meta:
+        notebook_meta["totalPages"] = None
 
 
 def build_bear_note_title(notebook_name, notebook_path):
@@ -1209,12 +1212,17 @@ def iterate_notebooks(obj, parentObj):
         if x['type'] == "notebook":
             nb_data = get_notebook(id)
             time.sleep(1)
+            logger.debug("Raw openNotebook response for '%s' (%s): %s", x['title'], id, nb_data)
+            logger.debug("Raw itemsList entry for '%s' (%s): %s", x['title'], id, x)
             modification_time = nb_data['metadata']['modificationTime']
+            api_total_pages = nb_data['metadata']['totalPages']
             current_update_time = parentItems[id]['updateTime']
+            stored_total_pages = parentItems[id].get('totalPages')
+            pages_changed = stored_total_pages is not None and api_total_pages != stored_total_pages
             pdf_path = os.path.join(SYNC_PATH, "{}.pdf".format(parentItems[id]['path']))
             desired_bear_title = build_bear_note_title(parentItems[id]['name'], parentItems[id]['path'])
             pdf_missing = not os.path.exists(pdf_path)
-            should_render_pdf = modification_time > current_update_time or pdf_missing
+            should_render_pdf = force_render or modification_time > current_update_time or pdf_missing or pages_changed
             should_seed_bear = (
                 bear_sync_enabled
                 and os.path.exists(pdf_path)
@@ -1249,10 +1257,14 @@ def iterate_notebooks(obj, parentObj):
             )
 
             logger.info(
-                "Notebook '%s': remote_modification=%s local_update=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s should_seed_pdf_folder=%s",
+                "Notebook '%s': remote_modification=%s (%s) local_update=%s (%s) api_pages=%s stored_pages=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s should_seed_pdf_folder=%s",
                 parentItems[id]['name'],
                 modification_time,
+                datetime.fromtimestamp(modification_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if modification_time else 'N/A',
                 current_update_time,
+                datetime.fromtimestamp(current_update_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if current_update_time else 'never',
+                api_total_pages,
+                stored_total_pages,
                 pdf_missing,
                 should_render_pdf,
                 should_seed_bear,
@@ -1283,6 +1295,7 @@ def iterate_notebooks(obj, parentObj):
                 global update_count
                 update_count += 1
                 parentItems[id]['updateTime'] = int(time.time())
+                parentItems[id]['totalPages'] = api_total_pages
             else:
                 if should_seed_bear and os.path.exists(pdf_path):
                     logger.info("Skipping PDF render for '%s'; reusing existing PDF for Bear sync", parentItems[id]['name'])
@@ -1364,8 +1377,10 @@ def get_all_notebooks():
     global cookies
     global notebook_name_counts
     global session
+    no_cache_headers = {"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
+    list_url = "{}?_t={}".format(URL_GET_NOTEBOOKS, int(time.time()))
     while True:
-        resp = session.get(URL_GET_NOTEBOOKS)
+        resp = session.get(list_url, headers=no_cache_headers)
         if resp.is_redirect:
             rm_cookies()
             authenticate()
@@ -1514,6 +1529,8 @@ def parse_args():
     parser.add_argument("--pdf-folder-path", type=str, default=None, help="Path to the destination folder for PDF exports. Overrides config.json.")
     parser.add_argument("--pdf-folder-force-resync", action="store_true", help="Re-copy PDFs to the export folder even when local sync state says they are already current.")
     parser.add_argument("--reset-pdf-folder-state", action="store_true", help="Clear local PDF folder sync markers before syncing.")
+    parser.add_argument("--force-render", action="store_true", help="Re-render all notebooks regardless of modification timestamps. Useful when the API returns stale data.")
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging, including full raw API responses for each notebook.")
     parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
     parser.add_argument("--launchd-remove", action="store_true", help="Remove the macOS launch agent.")
     parser.add_argument("--launchd-status", action="store_true", help="Print whether the macOS launch agent is installed.")
@@ -1539,6 +1556,7 @@ def main():
     global pdf_folder_sync_enabled
     global pdf_folder_path
     global pdf_folder_force_resync
+    global force_render
 
     args = parse_args()
     load_config()
@@ -1557,6 +1575,9 @@ def main():
     pdf_folder_force_resync = args.pdf_folder_force_resync or config.get("pdf_folder_force_resync", False)
     if pdf_folder_force_resync:
         pdf_folder_sync_enabled = True
+    force_render = args.force_render or config.get("force_render", False)
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
 
     if args.launchd_install:
         install_launch_agent()
