@@ -1,5 +1,8 @@
 # Kindle Scribe Sync
 
+## Note
+This is working, but there is a delay in some cases between when the Kindle Apps update and when these are available via API, specifically with documents that have modified pages, rather than brand new or deleted ones.
+
 ![Kindle Scribe Sync Icon](https://github.com/Koloss5421/KindleScribeSync/blob/main/KindleScribeSyncIcon.png?raw=true)
 
 ### Built with
