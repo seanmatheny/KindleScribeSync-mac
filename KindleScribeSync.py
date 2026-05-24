@@ -1230,12 +1230,18 @@ def iterate_notebooks(obj, parentObj):
                     or not parentItems[id].get('obsidianSynced', False)
                 )
             )
+            pdf_folder_dest_path = (
+                str(Path(pdf_folder_path) / "{}.pdf".format(parentItems[id]['path']))
+                if pdf_folder_sync_enabled and pdf_folder_path
+                else None
+            )
             should_seed_pdf_folder = (
                 pdf_folder_sync_enabled
                 and os.path.exists(pdf_path)
                 and (
                     pdf_folder_force_resync
                     or not parentItems[id].get('pdfFolderSynced', False)
+                    or (pdf_folder_dest_path is not None and not os.path.exists(pdf_folder_dest_path))
                 )
             )
 
@@ -1546,6 +1552,8 @@ def main():
     pdf_folder_sync_enabled = args.pdf_folder_sync or config.get("pdf_folder_sync", False)
     pdf_folder_path = args.pdf_folder_path or config.get("pdf_folder_path") or None
     pdf_folder_force_resync = args.pdf_folder_force_resync or config.get("pdf_folder_force_resync", False)
+    if pdf_folder_force_resync:
+        pdf_folder_sync_enabled = True
 
     if args.launchd_install:
         install_launch_agent()
