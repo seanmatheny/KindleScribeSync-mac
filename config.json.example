@@ -8,5 +8,10 @@
   "obsidian_force_resync": false,
   "pdf_folder_sync": false,
   "pdf_folder_path": "/path/to/your/pdf/export/folder",
-  "pdf_folder_force_resync": false
+  "pdf_folder_force_resync": false,
+  "craft_sync": false,
+  "craft_notes_path": "~/Documents/ScribeNotes",
+  "craft_force_resync": false,
+  "craft_space_id": "",
+  "craft_folder_id": ""
 }

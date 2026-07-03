@@ -13,13 +13,14 @@ This is working, but there is a delay in some cases between when the Kindle Apps
  - schedule
 
 ## Overview
-Syncs Kindle Scribe notebooks to local PDF files and optionally into one or more of three sync targets:
+Syncs Kindle Scribe notebooks to local PDF files and optionally into one or more of four sync targets:
 
 1. **Bear Notes** — creates/replaces a Bear note per notebook with the exported PDF attached.
 2. **Obsidian** — copies the PDF into your vault's attachments folder and creates/updates a markdown file that embeds it.
 3. **Local folder** — copies exported PDFs into a directory of your choosing, mirroring the Kindle folder hierarchy.
+4. **Craft Notes** — stores a single PDF per notebook in a ScribeNotes folder and creates a Craft document linking to it.
 
-All three targets are disabled by default and can be enabled independently (you may use any combination). Preferences are set in `config.json` (or overridden with CLI flags — see [Configuration](#configuration) and [Running](#running) below).
+All four targets are disabled by default and can be enabled independently (you may use any combination). Preferences are set in `config.json` (or overridden with CLI flags — see [Configuration](#configuration) and [Running](#running) below).
 
 Runs as a headless background daemon — no GUI or dock icon.
 Intended to be installed as a macOS launchd agent that starts automatically at login.
@@ -70,10 +71,15 @@ cp config.json.example config.json
 | `pdf_folder_sync` | bool | false | Copy updated PDFs into a local folder |
 | `pdf_folder_path` | string | — | Absolute path to the destination folder for exported PDFs |
 | `pdf_folder_force_resync` | bool | false | Re-copy all PDFs to the export folder even if already synced |
+| `craft_sync` | bool | false | Sync updated PDFs into a ScribeNotes folder and create Craft documents |
+| `craft_notes_path` | string | ~/Documents/ScribeNotes | Path to the ScribeNotes folder for PDF storage |
+| `craft_force_resync` | bool | false | Recreate Craft documents even if already synced |
+| `craft_space_id` | string | — | Craft space ID for document creation (optional) |
+| `craft_folder_id` | string | — | Craft folder ID for document creation (optional) |
 
 CLI flags always override config file values. `config.json` is gitignored; use `config.json.example` as the template to commit.
 
-> **Choosing sync targets**: all three destinations (Bear, Obsidian, local folder) are independent — enable whichever ones you want by setting their `*_sync` key to `true`. You may enable multiple at the same time.
+> **Choosing sync targets**: all four destinations (Bear, Obsidian, local folder, Craft) are independent — enable whichever ones you want by setting their `*_sync` key to `true`. You may enable multiple at the same time.
 
 > **Migrating from settings.json**: if you had a `settings.json` from a previous version, copy its values into `config.json` using the key names above.
 
@@ -146,6 +152,31 @@ Clear local PDF folder sync markers before a run
 python KindleScribeSync.py --once --pdf-folder-sync --reset-pdf-folder-state
 ```
 
+Sync updated notebooks into Craft Notes
+```
+python KindleScribeSync.py --once --craft-sync
+```
+
+Specify Craft space and folder for document placement
+```
+python KindleScribeSync.py --once --craft-sync --craft-space-id YOUR_SPACE_ID --craft-folder-id YOUR_FOLDER_ID
+```
+
+Override the ScribeNotes folder location
+```
+python KindleScribeSync.py --once --craft-sync --craft-notes-path /path/to/custom/folder
+```
+
+Force Craft document recreation
+```
+python KindleScribeSync.py --once --craft-sync --craft-force-resync
+```
+
+Clear local Craft sync markers before a run
+```
+python KindleScribeSync.py --once --craft-sync --reset-craft-state
+```
+
 ## launchd (Run at Login)
 
 Note: The script will detect the currently sourced virtual environment, and use that for the launchd agent. So best to try out a `--once` run first 
@@ -170,7 +201,7 @@ Application logs are written to `~/Library/Logs/KindleScribeSync/KindleScribeSyn
 launchd stdout/stderr are written to `~/Library/Logs/KindleScribeSync/launchd.out.log` and `~/Library/Logs/KindleScribeSync/launchd.err.log`.
 After changing `config.json`, run `--launchd-remove` then `--launchd-install` to reload.
 
-> **How launchd finds config.json**: the daemon sets its working directory to the folder containing `KindleScribeSync.py` and reads `config.json` from that same folder. To configure which sync targets are active (Bear, Obsidian, local folder) and any path options, edit `config.json` in the repository directory before installing (or reinstall after editing).
+> **How launchd finds config.json**: the daemon sets its working directory to the folder containing `KindleScribeSync.py` and reads `config.json` from that same folder. To configure which sync targets are active (Bear, Obsidian, local folder, Craft) and any path options, edit `config.json` in the repository directory before installing (or reinstall after editing).
 
 ## Bear Notes Sync Behavior
 
@@ -206,4 +237,22 @@ Each Bear note includes:
 - On each sync the exported PDF is copied into `<folder>/<notebook-path>.pdf`, mirroring the Kindle folder hierarchy. The destination file is always overwritten with the latest version.
 - To force re-copy of all PDFs even when the script believes they are current, run with `--pdf-folder-force-resync`.
 - To wipe only the local sync markers (not trigger a PDF re-render), use `--reset-pdf-folder-state`.
+
+## Craft Notes Sync Behavior
+
+- Craft sync is disabled by default; enable it with `"craft_sync": true` in `config.json` or `--craft-sync`.
+- PDFs are stored in a ScribeNotes folder (configurable via `craft_notes_path`, default `~/Documents/ScribeNotes`), mirroring the Kindle folder hierarchy.
+- Each notebook maintains a **single PDF** at a stable path (`ScribeNotes/<notebook-path>.pdf`). When the remote notebook changes, the PDF is overwritten in place — there is never more than one copy.
+- On first sync, a Craft document is created via the `craftdocs://` URL scheme containing a link to the local PDF file.
+- On subsequent syncs the PDF file is replaced; the Craft document's link remains valid because the file path does not change.
+- To recreate Craft documents (e.g. if you deleted them in Craft), run with `--craft-force-resync`.
+- To wipe only the local sync markers, use `--reset-craft-state`.
+- You may optionally set `craft_space_id` and `craft_folder_id` to control where documents are created in Craft.
+- When a notebook is deleted remotely, the corresponding PDF in ScribeNotes is removed automatically. The Craft document must be deleted manually (Craft's URL scheme does not support programmatic deletion).
+
+### Craft Permissions
+
+Craft must be granted permission to open URL scheme requests. On first use, macOS will prompt you to allow the `craftdocs://` URL to open Craft. Accept this prompt. No additional permissions or API keys are required — the integration uses Craft's built-in URL scheme support.
+
+If running via launchd (background), ensure Craft is installed and has been launched at least once so macOS recognizes the URL scheme handler.
 

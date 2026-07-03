@@ -113,6 +113,11 @@ obsidian_force_resync = False
 pdf_folder_sync_enabled = False
 pdf_folder_path = None
 pdf_folder_force_resync = False
+craft_sync_enabled = False
+craft_notes_path = None
+craft_force_resync = False
+craft_space_id = None
+craft_folder_id = None
 force_render = False
 notebook_name_counts = {}
 bear_pending_deletes = {}  # Notebooks queued for deletion with retry tracking
@@ -128,6 +133,11 @@ config = {
     "pdf_folder_sync": False,
     "pdf_folder_path": None,
     "pdf_folder_force_resync": False,
+    "craft_sync": False,
+    "craft_notes_path": None,
+    "craft_force_resync": False,
+    "craft_space_id": None,
+    "craft_folder_id": None,
 }
 
 
@@ -390,6 +400,29 @@ def handle_reset_pdf_folder_state(icon=None, item=None):
     notify("Reset local PDF folder sync state. The next sync will re-copy all PDFs to the export folder.")
 
 
+def reset_craft_sync_state(items):
+    """
+    Clear persisted Craft sync markers so Craft documents can be recreated from scratch.
+    """
+    if isinstance(items, dict):
+        iterable = items.values()
+    else:
+        iterable = items
+
+    for entry in iterable:
+        if isinstance(entry, dict):
+            entry["craftSynced"] = False
+            entry["craftDocId"] = None
+            if "items" in entry:
+                reset_craft_sync_state(entry["items"])
+
+
+def handle_reset_craft_state(icon=None, item=None):
+    reset_craft_sync_state(notebooks)
+    save_notebook_json()
+    notify("Reset local Craft sync state. The next Craft sync will recreate Craft documents.")
+
+
 def configure_schedule():
     schedule.clear("sync")
     schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks).tag("sync")
@@ -448,6 +481,10 @@ def ensure_notebook_tracking_defaults(notebook_id, notebook_meta):
         notebook_meta["obsidianSynced"] = False
     if "pdfFolderSynced" not in notebook_meta:
         notebook_meta["pdfFolderSynced"] = False
+    if "craftSynced" not in notebook_meta:
+        notebook_meta["craftSynced"] = False
+    if "craftDocId" not in notebook_meta:
+        notebook_meta["craftDocId"] = None
     if "totalPages" not in notebook_meta:
         notebook_meta["totalPages"] = None
 
@@ -845,6 +882,80 @@ def sync_pdf_to_folder(notebook_id, notebook_path, notebook_name, pdf_path, note
         logger.info("Copied PDF to export folder: %s", dest_path)
     except Exception as ex:
         logger.error("Failed to copy PDF to export folder for '%s': %s", notebook_name, ex)
+
+
+def get_craft_notes_dir():
+    """
+    Resolve the ScribeNotes folder path for Craft sync.
+    """
+    if craft_notes_path:
+        return Path(craft_notes_path).expanduser()
+    return Path.home() / "Documents" / "ScribeNotes"
+
+
+def sync_pdf_to_craft(notebook_id, notebook_path, notebook_name, pdf_path, notebook_meta):
+    """
+    Store the notebook PDF in the ScribeNotes folder (always overwrite for single-copy)
+    and create a Craft document linking to it via the craftdocs:// URL scheme.
+    The Craft document is only created once; on subsequent syncs the PDF is replaced
+    in place so the existing Craft document link remains valid.
+    """
+    if not craft_sync_enabled:
+        logger.debug("Craft sync disabled; skipping notebook '%s'", notebook_name)
+        return
+
+    ensure_notebook_tracking_defaults(notebook_id, notebook_meta)
+
+    notes_dir = get_craft_notes_dir()
+    dest_pdf = notes_dir / "{}.pdf".format(notebook_path)
+    dest_pdf.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(pdf_path, dest_pdf)
+        logger.info("Copied PDF to ScribeNotes folder: %s", dest_pdf)
+    except Exception as ex:
+        logger.error("Failed to copy PDF to ScribeNotes folder for '%s': %s", notebook_name, ex)
+        return
+
+    if notebook_meta.get("craftSynced") and not craft_force_resync:
+        logger.info("Craft document already exists for '%s'; PDF updated in place", notebook_name)
+        return
+
+    if sys.platform != "darwin":
+        logger.warning("Craft sync requested but this platform is not macOS; skipping document creation")
+        return
+
+    pdf_file_url = "file://{}".format(quote(str(dest_pdf), safe="/"))
+    markdown_content = (
+        "# {}\n\n"
+        "**Notebook Path:** {}\n"
+        "**Last Synced:** {}\n\n"
+        "[Open PDF]({})\n"
+    ).format(
+        notebook_name,
+        notebook_path,
+        datetime.now().isoformat(timespec="seconds"),
+        pdf_file_url,
+    )
+
+    craft_params = {
+        "title": notebook_name,
+        "content": markdown_content,
+    }
+    if craft_space_id:
+        craft_params["spaceId"] = craft_space_id
+    if craft_folder_id:
+        craft_params["folderId"] = craft_folder_id
+
+    craft_url = "craftdocs://createdocument?{}".format(urlencode(craft_params, quote_via=quote))
+
+    try:
+        logger.info("Creating Craft document for '%s' via URL scheme", notebook_name)
+        subprocess.run(["open", craft_url], check=True)
+        notebook_meta["craftSynced"] = True
+        notebook_meta["craftDocId"] = notebook_id
+        logger.info("Craft document created for '%s'", notebook_name)
+    except Exception as ex:
+        logger.error("Failed to create Craft document for '%s': %s", notebook_name, ex)
 
 
 def build_driver():
@@ -1255,9 +1366,23 @@ def iterate_notebooks(obj, parentObj):
                     or (pdf_folder_dest_path is not None and not os.path.exists(pdf_folder_dest_path))
                 )
             )
+            craft_dest_path = (
+                str(get_craft_notes_dir() / "{}.pdf".format(parentItems[id]['path']))
+                if craft_sync_enabled
+                else None
+            )
+            should_seed_craft = (
+                craft_sync_enabled
+                and os.path.exists(pdf_path)
+                and (
+                    craft_force_resync
+                    or not parentItems[id].get('craftSynced', False)
+                    or (craft_dest_path is not None and not os.path.exists(craft_dest_path))
+                )
+            )
 
             logger.info(
-                "Notebook '%s': remote_modification=%s (%s) local_update=%s (%s) api_pages=%s stored_pages=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s should_seed_pdf_folder=%s",
+                "Notebook '%s': remote_modification=%s (%s) local_update=%s (%s) api_pages=%s stored_pages=%s pdf_missing=%s should_render_pdf=%s should_seed_bear=%s bear_force_resync=%s bear_title=%s bear_version=%s should_seed_obsidian=%s should_seed_pdf_folder=%s should_seed_craft=%s",
                 parentItems[id]['name'],
                 modification_time,
                 datetime.fromtimestamp(modification_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if modification_time else 'N/A',
@@ -1273,6 +1398,7 @@ def iterate_notebooks(obj, parentObj):
                 parentItems[id].get('bearSyncVersion', 0),
                 should_seed_obsidian,
                 should_seed_pdf_folder,
+                should_seed_craft,
             )
 
             if should_render_pdf:
@@ -1288,6 +1414,7 @@ def iterate_notebooks(obj, parentObj):
                 sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
                 sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
                 sync_pdf_to_folder(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                sync_pdf_to_craft(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
 
                 for x in images:
                     os.remove(x)
@@ -1314,6 +1441,12 @@ def iterate_notebooks(obj, parentObj):
                     sync_pdf_to_folder(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
                 elif pdf_folder_sync_enabled:
                     logger.info("Skipping PDF folder sync for '%s'; no PDF changes and PDF already copied to folder", parentItems[id]['name'])
+
+                if should_seed_craft and os.path.exists(pdf_path):
+                    logger.info("Skipping PDF render for '%s'; reusing existing PDF for Craft sync", parentItems[id]['name'])
+                    sync_pdf_to_craft(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                elif craft_sync_enabled:
+                    logger.info("Skipping Craft sync for '%s'; no PDF changes and Craft document already tracked", parentItems[id]['name'])
 
 def id_exists_in_object(id, sync_items = []):
     """
@@ -1357,6 +1490,14 @@ def prune_orphans(items, sync_items):
                             logger.info("Removed orphaned PDF from export folder: %s", folder_pdf_path)
                     except Exception as ex:
                         logger.error("Failed to remove orphaned PDF from export folder: %s: %s", folder_pdf_path, ex)
+                if craft_sync_enabled:
+                    craft_pdf_path = get_craft_notes_dir() / "{}.pdf".format(dict_object['path'])
+                    try:
+                        if craft_pdf_path.exists():
+                            craft_pdf_path.unlink()
+                            logger.info("Removed orphaned PDF from ScribeNotes folder: %s", craft_pdf_path)
+                    except Exception as ex:
+                        logger.error("Failed to remove orphaned PDF from ScribeNotes folder: %s: %s", craft_pdf_path, ex)
                 try:
                     logger.info("Pruning '{}' Notebook".format(pdf_path))
                     os.remove(pdf_path)
@@ -1529,6 +1670,12 @@ def parse_args():
     parser.add_argument("--pdf-folder-path", type=str, default=None, help="Path to the destination folder for PDF exports. Overrides config.json.")
     parser.add_argument("--pdf-folder-force-resync", action="store_true", help="Re-copy PDFs to the export folder even when local sync state says they are already current.")
     parser.add_argument("--reset-pdf-folder-state", action="store_true", help="Clear local PDF folder sync markers before syncing.")
+    parser.add_argument("--craft-sync", action="store_true", help="Sync updated notebook PDFs to a ScribeNotes folder and create Craft documents via URL scheme (macOS only).")
+    parser.add_argument("--craft-force-resync", action="store_true", help="Recreate Craft documents even when local sync state says they are already current.")
+    parser.add_argument("--reset-craft-state", action="store_true", help="Clear local Craft sync markers before syncing.")
+    parser.add_argument("--craft-space-id", type=str, default=None, help="Craft space ID for document creation. Overrides config.json.")
+    parser.add_argument("--craft-folder-id", type=str, default=None, help="Craft folder ID for document creation. Overrides config.json.")
+    parser.add_argument("--craft-notes-path", type=str, default=None, help="Path to the ScribeNotes folder for Craft PDF storage. Default: ~/Documents/ScribeNotes. Overrides config.json.")
     parser.add_argument("--force-render", action="store_true", help="Re-render all notebooks regardless of modification timestamps. Useful when the API returns stale data.")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging, including full raw API responses for each notebook.")
     parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
@@ -1556,6 +1703,11 @@ def main():
     global pdf_folder_sync_enabled
     global pdf_folder_path
     global pdf_folder_force_resync
+    global craft_sync_enabled
+    global craft_notes_path
+    global craft_force_resync
+    global craft_space_id
+    global craft_folder_id
     global force_render
 
     args = parse_args()
@@ -1575,6 +1727,13 @@ def main():
     pdf_folder_force_resync = args.pdf_folder_force_resync or config.get("pdf_folder_force_resync", False)
     if pdf_folder_force_resync:
         pdf_folder_sync_enabled = True
+    craft_sync_enabled = args.craft_sync or config.get("craft_sync", False)
+    craft_notes_path = args.craft_notes_path or config.get("craft_notes_path") or None
+    craft_force_resync = args.craft_force_resync or config.get("craft_force_resync", False)
+    craft_space_id = args.craft_space_id or config.get("craft_space_id") or None
+    craft_folder_id = args.craft_folder_id or config.get("craft_folder_id") or None
+    if craft_force_resync:
+        craft_sync_enabled = True
     force_render = args.force_render or config.get("force_render", False)
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -1615,6 +1774,9 @@ def main():
 
     if args.reset_pdf_folder_state:
         handle_reset_pdf_folder_state()
+
+    if args.reset_craft_state:
+        handle_reset_craft_state()
 
     run_sync_loop()
     close_app()
