@@ -1203,9 +1203,19 @@ def convert_to_pdf(images, savepath):
         pdfdata = img2pdf.convert(images)
         f.write(pdfdata)
 
+def page_image_sort_key(image_path):
+    """
+    Sort key for page images: numeric page index parsed from names like 'img_12.png'.
+    Tar member order is arbitrary, so ordering must come from the filename index.
+    """
+    match = re.search(r"(\d+)", os.path.basename(image_path))
+    return int(match.group(1)) if match else 0
+
+
 def extract_tarfile(tar_file_data):
     """
-    Uses `tarfile` to extract the images from the amazon tar file. Returns an array of image paths.
+    Uses `tarfile` to extract the images from the amazon tar file. Returns an array of
+    image paths sorted by page index.
     """
     logger.info("Extracting notebook tar file data")
     tar_stream = io.BytesIO(tar_file_data)
@@ -1217,6 +1227,7 @@ def extract_tarfile(tar_file_data):
             extr_path = os.path.join(EXTRACT_PATH, member.name)
             images.append(extr_path)
 
+    images.sort(key=page_image_sort_key)
     return images
 
 def render_notebook(renderingToken, notebook_len):
@@ -1407,8 +1418,21 @@ def iterate_notebooks(obj, parentObj):
                 if (total_pages > 0):
                     total_pages = total_pages - 1
 
-                tardata = render_notebook(nb_data['renderingToken'], total_pages)
-                images = extract_tarfile(tardata)
+                images = None
+                for attempt in range(3):
+                    tardata = render_notebook(nb_data['renderingToken'], total_pages)
+                    try:
+                        images = extract_tarfile(tardata)
+                        break
+                    except tarfile.ReadError as ex:
+                        logger.warning(
+                            "Render response for '%s' was not a valid tar (attempt %s/3): %s",
+                            parentItems[id]['name'], attempt + 1, ex,
+                        )
+                        time.sleep(2)
+                if images is None:
+                    logger.error("Giving up rendering '%s' this run; will retry next sync", parentItems[id]['name'])
+                    continue
 
                 convert_to_pdf(images, pdf_path)
                 sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
