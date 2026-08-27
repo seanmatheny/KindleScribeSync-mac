@@ -26,6 +26,7 @@ import base64
 import io
 import json
 import logging
+import logging.handlers
 import os
 import pickle
 import plistlib
@@ -84,7 +85,7 @@ URL_RENDER_NOTEBOOK = "https://read.amazon.com/renderPage?startPage=0&endPage=[N
 
 ## Setup Logging
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-log_handlers = [logging.FileHandler(APP_LOG_FILE, encoding="utf-8")]
+log_handlers = [logging.handlers.RotatingFileHandler(APP_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")]
 if sys.stdout.isatty():
     log_handlers.append(logging.StreamHandler(sys.stdout))
 
@@ -1640,6 +1641,14 @@ def authenticate():
     save_cookies()
 
     session.cookies.update(cookies)
+
+    # Close the browser once cookies are captured; keeping Firefox resident
+    # costs hundreds of MB and ensure_driver() recreates it on the next auth.
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    driver = None
 
 def check_notebooks():
     """
