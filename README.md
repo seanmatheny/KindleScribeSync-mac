@@ -15,7 +15,7 @@ This is working, but there is a delay in some cases between when the Kindle Apps
 ## Overview
 Syncs Kindle Scribe notebooks to local PDF files and optionally into one or more of four sync targets:
 
-1. **Bear Notes** — creates/replaces a Bear note per notebook with the exported PDF attached.
+1. **Bear Notes** — creates/replaces a Bear note per notebook with the exported PDF attached. Note that the Bear API doesn't allow updating existing PDFs in notes.
 2. **Obsidian** — copies the PDF into your vault's attachments folder and creates/updates a markdown file that embeds it.
 3. **Local folder** — copies exported PDFs into a directory of your choosing, mirroring the Kindle folder hierarchy.
 4. **Craft Notes** — stores a single PDF per notebook in a ScribeNotes folder and creates a Craft document linking to it.
