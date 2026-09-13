@@ -201,6 +201,8 @@ Application logs are written to `~/Library/Logs/KindleScribeSync/KindleScribeSyn
 launchd stdout/stderr are written to `~/Library/Logs/KindleScribeSync/launchd.out.log` and `~/Library/Logs/KindleScribeSync/launchd.err.log`.
 After changing `config.json`, run `--launchd-remove` then `--launchd-install` to reload.
 
+The plist sets `KeepAlive` with `SuccessfulExit = false`, so launchd relaunches the daemon if it ever exits with an error or is killed (throttled to once per 60 seconds). A failed sync check (for example no network right after the Mac wakes from sleep) is logged with a traceback and retried at the next interval instead of terminating the process. If you installed the agent before this behaviour existed, run `--launchd-remove` then `--launchd-install` once to pick up the new plist.
+
 > **How launchd finds config.json**: the daemon sets its working directory to the folder containing `KindleScribeSync.py` and reads `config.json` from that same folder. To configure which sync targets are active (Bear, Obsidian, local folder, Craft) and any path options, edit `config.json` in the repository directory before installing (or reinstall after editing).
 
 ## Bear Notes Sync Behavior

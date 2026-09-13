@@ -220,7 +220,7 @@ def process_pending_manual_sync_request():
     except Exception as ex:
         logger.warning("Could not clear manual sync request file: %s", ex)
 
-    check_notebooks()
+    run_scheduled_check()
 
 
 def get_config_path():
@@ -260,6 +260,10 @@ def build_launch_agent_plist():
         "ProgramArguments": [python_path, script_path],
         "WorkingDirectory": str(Path(__file__).resolve().parent),
         "RunAtLoad": True,
+        # Relaunch after a crash or non-zero exit (e.g. an uncaught error), but
+        # not after a clean shutdown. ThrottleInterval stops a tight restart loop.
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 60,
         "ProcessType": "Background",
         "StandardOutPath": str(LAUNCHD_STDOUT_LOG),
         "StandardErrorPath": str(LAUNCHD_STDERR_LOG),
@@ -424,9 +428,22 @@ def handle_reset_craft_state(icon=None, item=None):
     notify("Reset local Craft sync state. The next Craft sync will recreate Craft documents.")
 
 
+def run_scheduled_check():
+    """
+    Run check_notebooks on behalf of the long-running daemon.
+    A transient failure (no network right after wake, an Amazon hiccup, a bad
+    response) must not take the whole process down, so log it with a traceback
+    and let the next scheduled interval try again.
+    """
+    try:
+        check_notebooks()
+    except Exception:
+        logger.exception("Sync check failed; will retry in %s minutes", UPDATE_MINUTES)
+
+
 def configure_schedule():
     schedule.clear("sync")
-    schedule.every(UPDATE_MINUTES).minutes.do(check_notebooks).tag("sync")
+    schedule.every(UPDATE_MINUTES).minutes.do(run_scheduled_check).tag("sync")
     logger.info("Scheduled sync every %s minutes", UPDATE_MINUTES)
 
 
@@ -1181,12 +1198,13 @@ def close_app():
 
 def run_sync_loop():
     logger.info("Running initial check")
-    check_notebooks()
 
     if args is not None and args.once:
+        check_notebooks()
         logger.info("Single-run mode complete")
         return
 
+    run_scheduled_check()
     configure_schedule()
     while running:
         process_pending_manual_sync_request()
