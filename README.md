@@ -11,6 +11,7 @@ This is working, but there is a delay in some cases between when the Kindle Apps
  - Selenium
  - img2pdf
  - schedule
+ - Swift + Apple Vision (handwriting OCR, optional)
 
 ## Overview
 Syncs Kindle Scribe notebooks to local PDF files and optionally into one or more of four sync targets:
@@ -21,6 +22,11 @@ Syncs Kindle Scribe notebooks to local PDF files and optionally into one or more
 4. **Craft Notes** — stores a single PDF per notebook in a ScribeNotes folder and creates a Craft document linking to it.
 
 All four targets are disabled by default and can be enabled independently (you may use any combination). Preferences are set in `config.json` (or overridden with CLI flags — see [Configuration](#configuration) and [Running](#running) below).
+
+On top of the PDFs, two optional text features (macOS only):
+
+5. **OCR notes** — recognises the handwriting in every notebook and keeps a searchable note per notebook in a notes app, checked against the PDF on every sync. Bear is supported today; Apple Notes and Craft are planned behind the same `notes_app` setting. See [OCR Notes Sync Behavior](#ocr-notes-sync-behavior).
+6. **TODO tasks** — every handwritten `TODO:` line becomes a task. See [TODO Tasks Behavior](#todo-tasks-behavior).
 
 Runs as a headless background daemon — no GUI or dock icon.
 Intended to be installed as a macOS launchd agent that starts automatically at login.
@@ -76,6 +82,16 @@ cp config.json.example config.json
 | `craft_force_resync` | bool | false | Recreate Craft documents even if already synced |
 | `craft_space_id` | string | — | Craft space ID for document creation (optional) |
 | `craft_folder_id` | string | — | Craft folder ID for document creation (optional) |
+| `notes_sync` | bool | false | OCR every notebook into a note and keep the notes matching the PDFs |
+| `notes_app` | string | bear | Notes app to write to. Supported: `bear` (needs Bear 2.10+) |
+| `notes_root_tag` | string | scribe | Tag the notes are filed under; Kindle folders become subtags (`#scribe/work`) |
+| `notes_attach_pdf` | bool | true | Attach the handwritten PDF to each note |
+| `notes_exclude` | list | [] | Notebook paths to leave out, as glob patterns, e.g. `["Personal/*", "Work/scratch"]` |
+| `notes_force_resync` | bool | false | Rewrite every note even when it already matches its PDF (prefer the CLI flag; left on, it rewrites every note on every sync) |
+| `ocr_languages` | list | ["en-US"] | Languages Vision should expect, most likely first |
+| `todo_sync` | bool | false | Collect handwritten `TODO:` lines as tasks. Needs `notes_sync` |
+| `todo_app` | string | bear | Where tasks go. Supported: `bear` (one central tasks note) |
+| `todo_note_title` | string | Scribe Tasks | Title of the Bear note that collects the tasks |
 
 CLI flags always override config file values. `config.json` is gitignored; use `config.json.example` as the template to commit.
 
@@ -177,6 +193,26 @@ Clear local Craft sync markers before a run
 python KindleScribeSync.py --once --craft-sync --reset-craft-state
 ```
 
+OCR the notebooks into notes and collect their TODO lines
+```
+python KindleScribeSync.py --once --notes-sync --todo-sync
+```
+
+Do only that, against the PDFs already on disk, without contacting Amazon. This is safe to run while the launchd agent is running, and is the quickest way to try the feature or to seed the notes the first time
+```
+python KindleScribeSync.py --notes-only --todo-sync
+```
+
+Rewrite every note even when it already matches its PDF
+```
+python KindleScribeSync.py --notes-only --notes-force-resync
+```
+
+Run the tests
+```
+python -m unittest discover tests
+```
+
 ## launchd (Run at Login)
 
 Note: The script will detect the currently sourced virtual environment, and use that for the launchd agent. So best to try out a `--once` run first 
@@ -257,4 +293,46 @@ Each Bear note includes:
 Craft must be granted permission to open URL scheme requests. On first use, macOS will prompt you to allow the `craftdocs://` URL to open Craft. Accept this prompt. No additional permissions or API keys are required — the integration uses Craft's built-in URL scheme support.
 
 If running via launchd (background), ensure Craft is installed and has been launched at least once so macOS recognizes the URL scheme handler.
+
+## OCR Notes Sync Behavior
+
+- OCR notes are disabled by default; enable them with `"notes_sync": true` in `config.json` or `--notes-sync`.
+- Requirements: macOS, [Bear](https://bear.app) 2.10 or later (it ships the `bearcli` command line tool this uses), and the Xcode Command Line Tools (`xcode-select --install`). There are no extra Python packages.
+- Handwriting is recognised on-device by Apple's Vision framework, through a small Swift program (`ocr/scribe-ocr.swift`). It is compiled into `bin/scribe-ocr` automatically on first use, or by hand with `ocr/build.sh`. It runs as a short-lived process, so the recognition models (about 500 MB) are never held in the sync daemon's memory.
+- Each notebook gets one Bear note: the notebook name as title (or `Folder / Name` when two notebooks share a name), a tag mirroring its Kindle folder (`#scribe/work`), the recognised text under a heading per page, and the handwritten PDF attached at the end.
+- **The note is a mirror and the PDF is the source of truth.** On every sync, including the ones where nothing changed on the Kindle, each note is checked against its PDF and rewritten only if they no longer match:
+  - the notebook changed → the note is rewritten in place and its PDF attachment replaced;
+  - the note was edited in Bear → your edit is overwritten, so keep your own thoughts in a separate note and link to this one;
+  - the note was trashed → it is restored (to stop syncing a notebook, add it to `notes_exclude`);
+  - the note was archived → it stays in the archive and keeps being updated there;
+  - the notebook was renamed or moved → the same note is retitled and retagged;
+  - the notebook was deleted from the Kindle → its note is moved to Bear's trash.
+- Bear does not need to be running and there are no permission prompts: `bearcli` works on Bear's database directly.
+- Sync state lives in `notes_sync_state.json`, and recognised text is cached in `notes_sync_cache/` so only changed notebooks are re-read. Both are safe to delete: every note carries a `Sync ID` line, so existing notes are found again rather than duplicated.
+- This is independent of the older `bear_sync` target, which attaches PDFs through Bear's x-callback-url and cannot update a note in place. Since OCR notes carry the PDF too, you will most likely want one or the other; with both enabled you get two Bear notes per notebook.
+
+### How good is the OCR?
+
+It depends almost entirely on the handwriting. Deliberate, separated lettering is read accurately. Fast joined-up cursive is not: expect roughly half of the words to come out right — enough to find a page by searching for a name or a keyword, not enough to read in place of the original, which is why the PDF is attached to every note. The page template (rules, grids, dots) and highlighter are removed before recognition, which recovers lines that are otherwise missed entirely.
+
+## TODO Tasks Behavior
+
+- TODO tasks are disabled by default; enable them with `"todo_sync": true` in `config.json` or `--todo-sync`. They are found in the OCR text, so `notes_sync` must be enabled too.
+- Write `TODO: wash the car` in a notebook and it becomes a task. Matching is deliberately a little looser than the literal `TODO:`, because handwriting recognition misreads colons and the letter O. Exactly what counts:
+
+  | Where | Case | Must be followed by | Examples |
+  |---|---|---|---|
+  | Start of a line (a bullet in front is fine) | upper case only | one of `:` `;` `.` `,` `-` | `TODO: x`, `- TODO: x`, `TODO - x`, `TODO; x`, `T0DO: x` |
+  | Start of a line | any case; `to do` and `to-do` too | `:` or `;` | `todo: x`, `Todo: x`, `To do: x` |
+  | Further along a line | upper case only | `:` or `;` | `Budget meeting. TODO: send slides` |
+
+  - A zero is accepted for either O (`T0DO`, `TOD0`).
+  - Vision often reads a handwritten `TODO:` as `TODD:` while rating both readings equally. When its first reading of a line has no TODO marker but one of its alternate readings does, the alternate is used, in the note as well as for the task. A line that really says `Todd:` is unaffected unless Vision itself proposes `TODO:` for it.
+  - Not tasks: `TODO wash the car` (nothing after the word), `todo - x` (lower case needs a colon), `TODO list`, `TODOs`, "things to do: relax".
+  - `TODO:` or a bare `TODO` alone on a line is a heading: the bullets directly under it become tasks, or else the single line under it.
+  - A TODO line that runs to the right-hand edge of the page continues onto the next line.
+- Tasks are collected as checkboxes in one Bear note, `Scribe Tasks` (`todo_note_title`), each linking back to the note and page it came from:
+  `- [ ] Wash the car — [todo, p. 1](bear://…) · 2026-09-17`
+- That note is only ever appended to. Tick tasks off, reword them, move them under your own headings or delete them; nothing there is rewritten, and a task that has been delivered once is never added again.
+- Upper-case `TODO:` on a line of its own, in your clearest handwriting, gives the most reliable results.
 

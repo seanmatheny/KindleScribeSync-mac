@@ -9,3 +9,7 @@ kindle_notebooks/
 extraction/
 bear_pending_deletes.json
 debug.log
+bin/
+notes_sync_state.json
+notes_sync_cache/
+notes_sync.lock

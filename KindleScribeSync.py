@@ -52,6 +52,8 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+import notes_sync
+
 ## CONSTANTS
 RENDER_HEIGHT = 2500
 RENDER_WIDTH = 1200
@@ -119,6 +121,8 @@ craft_notes_path = None
 craft_force_resync = False
 craft_space_id = None
 craft_folder_id = None
+notes_sync_enabled = False
+notes_settings = None
 force_render = False
 notebook_name_counts = {}
 bear_pending_deletes = {}  # Notebooks queued for deletion with retry tracking
@@ -139,6 +143,16 @@ config = {
     "craft_force_resync": False,
     "craft_space_id": None,
     "craft_folder_id": None,
+    "notes_sync": False,
+    "notes_app": "bear",
+    "notes_root_tag": "scribe",
+    "notes_attach_pdf": True,
+    "notes_exclude": [],
+    "notes_force_resync": False,
+    "ocr_languages": ["en-US"],
+    "todo_sync": False,
+    "todo_app": "bear",
+    "todo_note_title": "Scribe Tasks",
 }
 
 
@@ -161,7 +175,7 @@ def acquire_single_instance_lock():
             try:
                 old_pid = int(lock_path.read_text().strip())
                 os.kill(old_pid, 0)  # raises OSError if process is gone
-                logger.warning("Another instance is already running (PID %s). Exiting.", old_pid)
+                logger.info("The background sync is already running (PID %s).", old_pid)
                 return False
             except (OSError, ValueError):
                 pass  # stale lock
@@ -976,6 +990,24 @@ def sync_pdf_to_craft(notebook_id, notebook_path, notebook_name, pdf_path, noteb
         logger.error("Failed to create Craft document for '%s': %s", notebook_name, ex)
 
 
+def run_notes_sync():
+    """
+    OCR the exported PDFs into the notes app and collect their TODO lines.
+    Unlike the targets above this runs on every check, not only when a PDF was
+    re-rendered, so a note that was edited or deleted in the app is repaired too.
+    A failure here must never cost the PDF sync: log it and retry next pass.
+    """
+    if not notes_sync_enabled:
+        return
+
+    try:
+        notes_sync.reconcile(notebooks, SYNC_PATH, notes_settings)
+    except notes_sync.SyncError as ex:
+        logger.error("Notes sync failed: %s", ex)
+    except Exception:
+        logger.exception("Notes sync failed")
+
+
 def build_driver():
     """
     Build a Firefox webdriver instance with a mobile user-agent.
@@ -1696,6 +1728,7 @@ def check_notebooks():
                 driver = None
 
     get_all_notebooks()
+    run_notes_sync()
 
     # Report any notebooks that need manual Bear cleanup
     report_bear_manual_cleanup_required()
@@ -1727,6 +1760,10 @@ def parse_args():
     parser.add_argument("--craft-space-id", type=str, default=None, help="Craft space ID for document creation. Overrides config.json.")
     parser.add_argument("--craft-folder-id", type=str, default=None, help="Craft folder ID for document creation. Overrides config.json.")
     parser.add_argument("--craft-notes-path", type=str, default=None, help="Path to the ScribeNotes folder for Craft PDF storage. Default: ~/Documents/ScribeNotes. Overrides config.json.")
+    parser.add_argument("--notes-sync", action="store_true", help="OCR notebook PDFs into searchable notes and keep them matching the PDFs (macOS only; notes_app in config.json, currently 'bear').")
+    parser.add_argument("--notes-force-resync", action="store_true", help="Rewrite every OCR note even when it already matches its PDF.")
+    parser.add_argument("--notes-only", action="store_true", help="Run the notes sync once against the PDFs already on disk, without contacting Amazon, then exit. Safe while the launch agent is running.")
+    parser.add_argument("--todo-sync", action="store_true", help="Collect handwritten 'TODO:' lines as tasks (todo_app in config.json, currently a Bear tasks note). Needs notes sync.")
     parser.add_argument("--force-render", action="store_true", help="Re-render all notebooks regardless of modification timestamps. Useful when the API returns stale data.")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging, including full raw API responses for each notebook.")
     parser.add_argument("--launchd-install", action="store_true", help="Install the app as a macOS launch agent.")
@@ -1759,6 +1796,8 @@ def main():
     global craft_force_resync
     global craft_space_id
     global craft_folder_id
+    global notes_sync_enabled
+    global notes_settings
     global force_render
 
     args = parse_args()
@@ -1785,6 +1824,22 @@ def main():
     craft_folder_id = args.craft_folder_id or config.get("craft_folder_id") or None
     if craft_force_resync:
         craft_sync_enabled = True
+    notes_settings = notes_sync.Settings(
+        notes_app=config.get("notes_app") or "bear",
+        root_tag=config.get("notes_root_tag") or "scribe",
+        attach_pdf=config.get("notes_attach_pdf", True),
+        exclude=config.get("notes_exclude") or [],
+        force_resync=args.notes_force_resync or config.get("notes_force_resync", False),
+        ocr_languages=config.get("ocr_languages") or ["en-US"],
+        todo_sync=args.todo_sync or config.get("todo_sync", False),
+        todo_app=config.get("todo_app") or "bear",
+        todo_note_title=config.get("todo_note_title") or "Scribe Tasks",
+    )
+    notes_sync_enabled = (
+        args.notes_sync or args.notes_only or notes_settings.force_resync or config.get("notes_sync", False)
+    )
+    if notes_settings.todo_sync and not notes_sync_enabled:
+        logger.warning("todo_sync needs notes_sync: TODO lines are found in the OCR text. Skipping it.")
     force_render = args.force_render or config.get("force_render", False)
     if args.debug:
         logger.setLevel(logging.DEBUG)
@@ -1799,10 +1854,18 @@ def main():
         launch_agent_status()
         return
 
+    if args.notes_only:
+        # Reads notebooks.json and the PDFs without changing either, and notes_sync
+        # takes its own lock, so this can run beside the launch agent.
+        load_notebook_json()
+        run_notes_sync()
+        return
+
     if not acquire_single_instance_lock():
         if args.once and request_manual_sync_from_running_instance():
-            logger.info("Another instance is active; queued one manual sync request and exiting.")
+            logger.info("Asked it to sync now; it starts within a second. Follow along with: tail -f %s", APP_LOG_FILE)
             return
+        logger.warning("Only one instance can run at a time; exiting. Use --once to make the running one sync now.")
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, handle_signal)

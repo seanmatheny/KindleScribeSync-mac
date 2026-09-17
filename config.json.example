@@ -13,5 +13,15 @@
   "craft_notes_path": "~/Documents/ScribeNotes",
   "craft_force_resync": false,
   "craft_space_id": "",
-  "craft_folder_id": ""
+  "craft_folder_id": "",
+  "notes_sync": false,
+  "notes_app": "bear",
+  "notes_root_tag": "scribe",
+  "notes_attach_pdf": true,
+  "notes_exclude": [],
+  "notes_force_resync": false,
+  "ocr_languages": ["en-US"],
+  "todo_sync": false,
+  "todo_app": "bear",
+  "todo_note_title": "Scribe Tasks"
 }
