@@ -1,7 +1,7 @@
 # Kindle Scribe Sync
 
 ## Note
-This is working, but there is a delay in some cases between when the Kindle Apps update and when these are available via API, specifically with documents that have modified pages, rather than brand new or deleted ones.
+Amazon's API reports an edit to an existing page straight away (it bumps the notebook's modification time) but can keep serving the old page images for a while afterwards; brand new or deleted pages are not affected. A sync that lands in that window downloads a stale copy. To recover from this, any notebook Amazon reports as modified in the last 72 hours is downloaded again on every sync, and its PDF is rebuilt as soon as the page images differ from the ones it was made from. Expect an edited page to arrive a sync or two late rather than not at all. `--force-render` remains available for anything older.
 
 ![Kindle Scribe Sync Icon](https://github.com/Koloss5421/KindleScribeSync/blob/main/KindleScribeSyncIcon.png?raw=true)
 

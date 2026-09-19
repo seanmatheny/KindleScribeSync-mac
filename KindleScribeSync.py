@@ -23,6 +23,7 @@
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -63,6 +64,8 @@ BEAR_DELETE_RETRY_RUNS = 24
 COOKIES_FILE = "cookies.pkl"
 UPDATE_MINUTES = 30
 BEAR_SYNC_VERSION = 3
+# How long after Amazon reports an edit to keep comparing its page images with ours.
+RENDER_RECHECK_SECONDS = 72 * 60 * 60
 CONFIG_FILE = "config.json"
 LOCK_FILE = "kindlescribesync.lock"
 MANUAL_SYNC_REQUEST_FILE = "kindlescribesync.manual-sync.request"
@@ -1254,6 +1257,17 @@ def convert_to_pdf(images, savepath):
         pdfdata = img2pdf.convert(images)
         f.write(pdfdata)
 
+def hash_page_images(images):
+    """
+    Fingerprint a notebook's page images, in page order. Amazon returns identical
+    bytes for an unchanged page, so this tells a stale render from a fresh one.
+    """
+    digest = hashlib.sha256()
+    for image_path in images:
+        digest.update(Path(image_path).read_bytes())
+    return digest.hexdigest()
+
+
 def page_image_sort_key(image_path):
     """
     Sort key for page images: numeric page index parsed from names like 'img_12.png'.
@@ -1463,7 +1477,15 @@ def iterate_notebooks(obj, parentObj):
                 should_seed_craft,
             )
 
-            if should_render_pdf:
+            # Amazon stamps modificationTime the moment a page is edited, but can go on
+            # serving the old page images for a while afterwards. A render taken in that
+            # window is stale, and the timestamps alone would never flag it again, so a
+            # recently modified notebook is fetched every pass and rebuilt when its page
+            # images differ from the ones the current PDF was made from.
+            recheck_render = not should_render_pdf and time.time() - modification_time < RENDER_RECHECK_SECONDS
+            rebuilt = False
+
+            if should_render_pdf or recheck_render:
                 total_pages = nb_data['metadata']['totalPages']
 
                 if (total_pages > 0):
@@ -1485,20 +1507,29 @@ def iterate_notebooks(obj, parentObj):
                     logger.error("Giving up rendering '%s' this run; will retry next sync", parentItems[id]['name'])
                     continue
 
-                convert_to_pdf(images, pdf_path)
-                sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
-                sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
-                sync_pdf_to_folder(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
-                sync_pdf_to_craft(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                content_hash = hash_page_images(images)
+                if should_render_pdf or content_hash != parentItems[id].get('contentHash'):
+                    if recheck_render:
+                        logger.info("Pages of '%s' changed since its last render; rebuilding the PDF", parentItems[id]['name'])
+                    convert_to_pdf(images, pdf_path)
+                    sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                    sync_pdf_to_obsidian(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                    sync_pdf_to_folder(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+                    sync_pdf_to_craft(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
+
+                    global update_count
+                    update_count += 1
+                    parentItems[id]['updateTime'] = int(time.time())
+                    parentItems[id]['totalPages'] = api_total_pages
+                    parentItems[id]['contentHash'] = content_hash
+                    rebuilt = True
+                else:
+                    logger.info("Re-checked recently modified '%s'; pages unchanged", parentItems[id]['name'])
 
                 for x in images:
                     os.remove(x)
-                
-                global update_count
-                update_count += 1
-                parentItems[id]['updateTime'] = int(time.time())
-                parentItems[id]['totalPages'] = api_total_pages
-            else:
+
+            if not rebuilt:
                 if should_seed_bear and os.path.exists(pdf_path):
                     logger.info("Skipping PDF render for '%s'; reusing existing PDF for Bear sync", parentItems[id]['name'])
                     sync_pdf_to_bear(id, parentItems[id]['path'], parentItems[id]['name'], pdf_path, parentItems[id])
